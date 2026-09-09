@@ -115,9 +115,10 @@ app.delete("/api/items/:id", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Speech-to-text (NVIDIA Nemotron ASR) ----------
-// Admin's recorded audio clip comes in here as a file upload. We send it to
-// NVIDIA's hosted ASR model to get back plain text, then hand that text to
+// ---------- Speech-to-text (NVIDIA Nemotron 3.5 ASR via Together AI) ----------
+// Admin's recorded audio clip comes in here as a file upload. NVIDIA only exposes
+// this model over gRPC (Riva) on their own hosted API, so we call it through
+// Together AI's plain REST endpoint instead, then hand the text to
 // /api/voice-command below (same endpoint the browser-STT version used).
 app.post("/api/transcribe", requireAdmin, upload.single("audio"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No audio received." });
@@ -126,12 +127,12 @@ app.post("/api/transcribe", requireAdmin, upload.single("audio"), async (req, re
     const form = new FormData();
     form.append("file", new Blob([req.file.buffer], { type: req.file.mimetype || "audio/wav" }), "command.wav");
     form.append("model", "nvidia/nemotron-3.5-asr-streaming-0.6b");
-    form.append("language", "en-US");
+    form.append("language", "en");
     form.append("response_format", "json");
 
-    const asrResponse = await fetch("https://integrate.api.nvidia.com/v1/audio/transcriptions", {
+    const asrResponse = await fetch("https://api.together.xyz/v1/audio/transcriptions", {
       method: "POST",
-      headers: { Authorization: `Bearer ${process.env.NVIDIA_NIM_API_KEY}` },
+      headers: { Authorization: `Bearer ${process.env.TOGETHER_API_KEY}` },
       body: form,
     });
 
