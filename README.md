@@ -73,6 +73,12 @@ Open the URL Vite prints (usually http://localhost:5173).
   action, which gets applied to Neon. Adding a brand-new top-level category
   is manual-only (use the "Add category" box) — voice only handles
   subcategories and items.
+- The admin panel also shows a **spending summary** above the voice panel:
+  totals for today, this month, and the last 3 months, based on the price
+  of each item on the day it was added, plus two expandable views —
+  a per-day breakdown for the last 30 days, and a date/time log of every
+  item added, with a range selector (30 days / 3 / 6 months / 1 year /
+  all time) and a "Load more" button so nothing older is ever cut off.
 
 ## Notes
 

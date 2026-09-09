@@ -115,6 +115,91 @@ app.delete("/api/items/:id", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- Spend summary ----------
+// Treats each item's price as money spent on the day it was added, and
+// totals that up for "today", "this month", and "the last 3 months", plus
+// a per-day breakdown for the last 30 days and a paginated item-by-item
+// log (with exact date/time) so the admin can see a trend or drill into
+// exactly when each purchase happened. The log's time range and page are
+// controlled by ?range= (30d | 3m | 6m | 1y | all, default 3m) and
+// ?offset= (default 0) query params, so nothing is silently cut off —
+// older entries are just a "Load more" click away.
+// Price is stored as TEXT (so it can hold "", partial input, etc. while
+// editing), so this strips anything that isn't a digit or a dot before
+// summing — non-numeric prices just contribute 0.
+const RANGE_CUTOFFS = {
+  "30d": () => new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+  "3m": () => { const d = new Date(); d.setMonth(d.getMonth() - 3); return d; },
+  "6m": () => { const d = new Date(); d.setMonth(d.getMonth() - 6); return d; },
+  "1y": () => { const d = new Date(); d.setFullYear(d.getFullYear() - 1); return d; },
+  all: () => new Date(0),
+};
+const ENTRIES_PAGE_SIZE = 100;
+
+app.get("/api/spend-summary", requireAdmin, async (req, res) => {
+  try {
+    const toNumber = (row) => Number(row.total) || 0;
+
+    const [todayRow] = await sql`
+      SELECT COALESCE(SUM(NULLIF(regexp_replace(price, '[^0-9.]', '', 'g'), '')::numeric), 0) AS total
+      FROM items WHERE created_at >= date_trunc('day', now())`;
+
+    const [monthRow] = await sql`
+      SELECT COALESCE(SUM(NULLIF(regexp_replace(price, '[^0-9.]', '', 'g'), '')::numeric), 0) AS total
+      FROM items WHERE created_at >= date_trunc('month', now())`;
+
+    const [threeMonthRow] = await sql`
+      SELECT COALESCE(SUM(NULLIF(regexp_replace(price, '[^0-9.]', '', 'g'), '')::numeric), 0) AS total
+      FROM items WHERE created_at >= now() - interval '3 months'`;
+
+    const daily = await sql`
+      SELECT date_trunc('day', created_at) AS day,
+             COALESCE(SUM(NULLIF(regexp_replace(price, '[^0-9.]', '', 'g'), '')::numeric), 0) AS total
+      FROM items
+      WHERE created_at >= now() - interval '30 days'
+      GROUP BY day
+      ORDER BY day DESC`;
+
+    // Individual entries (item + exact date/time it was added), most recent first.
+    const range = RANGE_CUTOFFS[req.query.range] ? req.query.range : "3m";
+    const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+    const cutoff = RANGE_CUTOFFS[range]();
+
+    const entries = await sql`
+      SELECT i.name, i.price, i.created_at,
+             s.name AS subcategory, c.name AS category
+      FROM items i
+      JOIN subcategories s ON s.id = i.subcategory_id
+      JOIN categories c ON c.id = s.category_id
+      WHERE i.created_at >= ${cutoff.toISOString()}
+      ORDER BY i.created_at DESC
+      LIMIT ${ENTRIES_PAGE_SIZE + 1} OFFSET ${offset}`;
+
+    const hasMore = entries.length > ENTRIES_PAGE_SIZE;
+    const pageEntries = hasMore ? entries.slice(0, ENTRIES_PAGE_SIZE) : entries;
+
+    res.json({
+      today: toNumber(todayRow),
+      thisMonth: toNumber(monthRow),
+      last3Months: toNumber(threeMonthRow),
+      daily: daily.map((d) => ({ day: d.day, total: toNumber(d) })),
+      entries: pageEntries.map((e) => ({
+        name: e.name,
+        price: e.price,
+        createdAt: e.created_at,
+        subcategory: e.subcategory,
+        category: e.category,
+      })),
+      range,
+      offset,
+      hasMore,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not load spend summary." });
+  }
+});
+
 // ---------- Speech-to-text (Groq-hosted Whisper, free tier) ----------
 // Admin's recorded audio clip comes in here as a file upload. We send it to
 // Groq's free, OpenAI-compatible endpoint for transcription, then hand the

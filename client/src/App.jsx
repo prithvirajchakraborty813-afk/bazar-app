@@ -150,6 +150,132 @@ function GeneralView({ onLogout }) {
   );
 }
 
+function SpendingPanel({ password, reloadKey }) {
+  const [summary, setSummary] = useState(null);
+  const [showDaily, setShowDaily] = useState(false);
+  const [showLog, setShowLog] = useState(false);
+  const [range, setRange] = useState("3m");
+  const [entries, setEntries] = useState([]);
+  const [offset, setOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  const headers = { "x-admin-password": password };
+
+  const fetchEntries = (r, o) =>
+    fetch(`${API}/spend-summary?range=${r}&offset=${o}`, { headers })
+      .then((res) => (res.ok ? res.json() : null));
+
+  useEffect(() => {
+    fetchEntries(range, 0).then((data) => {
+      if (!data) return;
+      setSummary(data);
+      setEntries(data.entries);
+      setOffset(0);
+      setHasMore(data.hasMore);
+    });
+  }, [password, reloadKey, range]);
+
+  const loadMore = async () => {
+    setLoadingMore(true);
+    const data = await fetchEntries(range, offset + 100);
+    if (data) {
+      setEntries((prev) => [...prev, ...data.entries]);
+      setOffset(offset + 100);
+      setHasMore(data.hasMore);
+    }
+    setLoadingMore(false);
+  };
+
+  if (!summary) return null;
+
+  const fmt = (n) => `Price=${Number(n).toFixed(2).replace(/\.00$/, "")}`;
+  const fmtDateTime = (ts) =>
+    new Date(ts).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+
+  return (
+    <div style={{ background: "#fff", border: "1px solid #e3ddcf", borderRadius: "4px", padding: "12px 14px", marginBottom: "18px" }}>
+      <p style={{ margin: "0 0 8px", fontSize: "12px", color: "#8a8477" }}>Spending summary (based on when items were added)</p>
+      <div style={{ display: "flex", gap: "18px", flexWrap: "wrap" }}>
+        <div>
+          <p style={{ margin: 0, fontSize: "11px", color: "#a39d8a" }}>Today</p>
+          <p style={{ margin: 0, fontSize: "15px", fontWeight: "600", color: "#2a2a26" }}>{fmt(summary.today)}</p>
+        </div>
+        <div>
+          <p style={{ margin: 0, fontSize: "11px", color: "#a39d8a" }}>This month</p>
+          <p style={{ margin: 0, fontSize: "15px", fontWeight: "600", color: "#2a2a26" }}>{fmt(summary.thisMonth)}</p>
+        </div>
+        <div>
+          <p style={{ margin: 0, fontSize: "11px", color: "#a39d8a" }}>Last 3 months</p>
+          <p style={{ margin: 0, fontSize: "15px", fontWeight: "600", color: "#2a2a26" }}>{fmt(summary.last3Months)}</p>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: "14px", marginTop: "10px" }}>
+        <button
+          onClick={() => setShowDaily(!showDaily)}
+          style={{ background: "none", border: "none", color: "#6b6659", fontSize: "11px", padding: 0, cursor: "pointer", textDecoration: "underline" }}
+        >
+          {showDaily ? "Hide" : "Show"} last 30 days by day
+        </button>
+        <button
+          onClick={() => setShowLog(!showLog)}
+          style={{ background: "none", border: "none", color: "#6b6659", fontSize: "11px", padding: 0, cursor: "pointer", textDecoration: "underline" }}
+        >
+          {showLog ? "Hide" : "Show"} date/time log
+        </button>
+      </div>
+
+      {showDaily && (
+        <div style={{ marginTop: "8px", maxHeight: "160px", overflowY: "auto", borderTop: "1px solid #f1ede1", paddingTop: "6px" }}>
+          {summary.daily.length === 0 && <p style={{ fontSize: "12px", color: "#a39d8a", margin: 0 }}>No items added in the last 30 days.</p>}
+          {summary.daily.map((d) => (
+            <div key={d.day} style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", color: "#3d3a2f", padding: "2px 0" }}>
+              <span>{new Date(d.day).toLocaleDateString()}</span>
+              <span>{fmt(d.total)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {showLog && (
+        <div style={{ marginTop: "8px", borderTop: "1px solid #f1ede1", paddingTop: "8px" }}>
+          <select value={range} onChange={(e) => setRange(e.target.value)} style={{ ...inputStyle, marginBottom: "8px", width: "auto", fontSize: "12px" }}>
+            <option value="30d">Last 30 days</option>
+            <option value="3m">Last 3 months</option>
+            <option value="6m">Last 6 months</option>
+            <option value="1y">Last 1 year</option>
+            <option value="all">All time</option>
+          </select>
+
+          <div style={{ maxHeight: "220px", overflowY: "auto" }}>
+            {entries.length === 0 && <p style={{ fontSize: "12px", color: "#a39d8a", margin: 0 }}>No items added in this range.</p>}
+            {entries.map((e, i) => (
+              <div key={i} style={{ display: "flex", justifyContent: "space-between", gap: "8px", fontSize: "12px", color: "#3d3a2f", padding: "3px 0", borderBottom: "1px solid #f8f5ec" }}>
+                <span style={{ color: "#8a8477", flexShrink: 0 }}>{fmtDateTime(e.createdAt)}</span>
+                <span style={{ flex: 1, textAlign: "right" }}>
+                  {e.name} <span style={{ color: "#a39d8a" }}>({e.category} / {e.subcategory})</span>
+                </span>
+                <span style={{ flexShrink: 0, fontWeight: "600" }}>{fmt(e.price)}</span>
+              </div>
+            ))}
+          </div>
+
+          {hasMore && (
+            <button
+              onClick={loadMore}
+              disabled={loadingMore}
+              style={{ background: "none", border: "none", color: "#6b6659", fontSize: "11px", padding: "8px 0 0", cursor: "pointer", textDecoration: "underline" }}
+            >
+              {loadingMore ? "Loading..." : "Load more"}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function VoicePanel({ password, onApplied }) {
   const [recording, setRecording] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -315,6 +441,7 @@ function AdminView({ password, onLogout }) {
     <div style={{ minHeight: "560px", background: "#f6f3ec" }}>
       <Header title="Admin" onLogout={onLogout} onRefresh={reload} />
       <div style={{ padding: "16px 20px" }}>
+        <SpendingPanel password={password} reloadKey={data} />
         <VoicePanel password={password} onApplied={reload} />
 
         <div style={{ display: "flex", gap: "8px", marginBottom: "18px" }}>
