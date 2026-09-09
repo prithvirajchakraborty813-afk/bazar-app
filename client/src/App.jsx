@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 
-const API = "http://localhost:3001/api";
+const API = "https://bazar-app-9yxf.onrender.com/api";
 
 function Login({ onLogin }) {
   const [role, setRole] = useState("general");
