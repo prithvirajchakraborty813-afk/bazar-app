@@ -125,7 +125,7 @@ app.post("/api/transcribe", requireAdmin, upload.single("audio"), async (req, re
   try {
     const form = new FormData();
     form.append("file", new Blob([req.file.buffer], { type: req.file.mimetype || "audio/wav" }), "command.wav");
-    form.append("model", "nvidia/nemotron-asr-streaming");
+    form.append("model", "nvidia/nemotron-3.5-asr-streaming-0.6b");
     form.append("language", "en-US");
     form.append("response_format", "json");
 
