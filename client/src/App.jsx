@@ -134,7 +134,7 @@ function GeneralView({ onLogout }) {
                             )}
                             <p style={{ margin: "0 0 2px", fontSize: "13px", fontWeight: "600", color: "#2a2a26" }}>{item.name}</p>
                             <p style={{ margin: "0 0 4px", fontSize: "12px", color: "#8a8477" }}>{item.desc}</p>
-                            <p style={{ margin: 0, fontSize: "13px", color: "#3d3a2f", fontWeight: "600" }}>\u20B9{item.price}</p>
+                            <p style={{ margin: 0, fontSize: "13px", color: "#3d3a2f", fontWeight: "600" }}>Price: {item.price}</p>
                           </div>
                         ))}
                       </div>
@@ -357,7 +357,7 @@ function AdminView({ password, onLogout }) {
                         <div style={{ padding: "0 10px 10px" }}>
                           {sub.items.map((item) => (
                             <div key={item.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 0", borderTop: "1px solid #f1ede1", fontSize: "13px" }}>
-                              <span style={{ color: "#2a2a26" }}>{item.name} <span style={{ color: "#a39d8a" }}>\u2014 \u20B9{item.price}</span></span>
+                              <span style={{ color: "#2a2a26" }}>{item.name} <span style={{ color: "#a39d8a" }}>\u2014 Price={item.price}</span></span>
                               <span style={{ display: "flex", gap: "6px" }}>
                                 <button onClick={() => startEdit(cat.id, sub.id, item)} style={ghostBtn}>Edit</button>
                                 <button onClick={() => removeItem(item.id)} style={ghostDanger}>Remove</button>
