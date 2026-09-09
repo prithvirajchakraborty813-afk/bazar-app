@@ -61,11 +61,12 @@ Open the URL Vite prints (usually http://localhost:5173).
 - Log in as **general** to browse (read-only).
 - Log in as **admin** with the password you set in `.env`.
 - In the admin panel, use "Add category" / "Add sub" / "Add item" forms, or
-  click **Speak a command** and say something like:
-  *"add item Alu price 25 to Bazar in Family"*
-- Voice recognition uses the browser's built-in speech-to-text (Chrome works
-  best). The transcribed text is sent to your server, which asks NVIDIA NIM
-  to turn it into a structured action, then applies it to Neon.
+  click **Speak a command**, allow microphone access, say something like
+  *"add item Alu price 25 to Bazar in Family"*, then click **Stop recording**.
+- Voice input records real audio and sends it to NVIDIA's hosted
+  `nvidia/nemotron-asr-streaming` model for transcription, then the
+  transcript is sent to your text model to turn it into a structured
+  action, which gets applied to Neon.
 
 ## Notes
 

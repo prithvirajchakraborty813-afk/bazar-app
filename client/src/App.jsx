@@ -151,49 +151,81 @@ function GeneralView({ onLogout }) {
 }
 
 function VoicePanel({ password, onApplied }) {
-  const [listening, setListening] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [transcript, setTranscript] = useState("");
   const [status, setStatus] = useState("");
   const [supported, setSupported] = useState(true);
+  const mediaRecorderRef = React.useRef(null);
+  const chunksRef = React.useRef([]);
 
-  const startListening = () => {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) {
+  const startRecording = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
       setSupported(false);
       return;
     }
-    const recognition = new SR();
-    recognition.lang = "en-IN";
-    recognition.interimResults = false;
-    recognition.maxAlternatives = 1;
+    setStatus("");
+    setTranscript("");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      chunksRef.current = [];
+      recorder.ondataavailable = (e) => chunksRef.current.push(e.data);
+      recorder.onstop = () => {
+        stream.getTracks().forEach((t) => t.stop());
+        sendRecording();
+      };
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setRecording(true);
+    } catch {
+      setStatus("Microphone access denied.");
+    }
+  };
 
-    recognition.onstart = () => { setListening(true); setStatus(""); };
-    recognition.onerror = () => { setListening(false); setStatus("Could not hear that. Try again."); };
-    recognition.onend = () => setListening(false);
+  const stopRecording = () => {
+    mediaRecorderRef.current?.stop();
+    setRecording(false);
+  };
 
-    recognition.onresult = async (event) => {
-      const text = event.results[0][0].transcript;
-      setTranscript(text);
-      setStatus("Sending to assistant...");
-      try {
-        const res = await fetch(`${API}/voice-command`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-admin-password": password },
-          body: JSON.stringify({ transcript: text }),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          setStatus(data.error || "Command not understood.");
-          return;
-        }
-        setStatus(`Done: ${data.applied.action.replace("_", " ")}`);
-        onApplied();
-      } catch {
-        setStatus("Could not reach the server.");
+  const sendRecording = async () => {
+    setBusy(true);
+    setStatus("Transcribing...");
+    try {
+      const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+      const formData = new FormData();
+      formData.append("audio", blob, "command.webm");
+
+      const transcribeRes = await fetch(`${API}/transcribe`, {
+        method: "POST",
+        headers: { "x-admin-password": password },
+        body: formData,
+      });
+      const transcribeData = await transcribeRes.json();
+      if (!transcribeRes.ok) {
+        setStatus(transcribeData.error || "Could not transcribe that.");
+        return;
       }
-    };
+      setTranscript(transcribeData.transcript);
+      setStatus("Sending to assistant...");
 
-    recognition.start();
+      const res = await fetch(`${API}/voice-command`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-admin-password": password },
+        body: JSON.stringify({ transcript: transcribeData.transcript }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setStatus(data.error || "Command not understood.");
+        return;
+      }
+      setStatus(`Done: ${data.applied.action.replace("_", " ")}`);
+      onApplied();
+    } catch {
+      setStatus("Could not reach the server.");
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -201,9 +233,13 @@ function VoicePanel({ password, onApplied }) {
       <p style={{ margin: "0 0 8px", fontSize: "12px", color: "#8a8477" }}>
         Voice command \u2014 try "add item Alu price 25 to Bazar in Family"
       </p>
-      {!supported && <p style={{ fontSize: "12px", color: "#b0473f", margin: "0 0 8px" }}>Voice input isn't supported in this browser. Try Chrome.</p>}
-      <button onClick={startListening} disabled={listening || !supported} style={{ ...primaryBtn, opacity: listening ? 0.6 : 1 }}>
-        {listening ? "Listening..." : "Speak a command"}
+      {!supported && <p style={{ fontSize: "12px", color: "#b0473f", margin: "0 0 8px" }}>Microphone access isn't available in this browser.</p>}
+      <button
+        onClick={recording ? stopRecording : startRecording}
+        disabled={busy || !supported}
+        style={{ ...primaryBtn, opacity: busy ? 0.6 : 1, background: recording ? "#b0473f" : "#3d3a2f" }}
+      >
+        {recording ? "Stop recording" : busy ? "Working..." : "Speak a command"}
       </button>
       {transcript && <p style={{ fontSize: "12px", color: "#6b6659", margin: "8px 0 0" }}>Heard: "{transcript}"</p>}
       {status && <p style={{ fontSize: "12px", color: "#3d3a2f", margin: "4px 0 0" }}>{status}</p>}

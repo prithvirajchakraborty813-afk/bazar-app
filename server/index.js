@@ -1,10 +1,12 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import multer from "multer";
 import { neon } from "@neondatabase/serverless";
 
 const sql = neon(process.env.DATABASE_URL);
 const app = express();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 app.use(cors());
 app.use(express.json());
 
@@ -111,6 +113,43 @@ app.put("/api/items/:id", requireAdmin, async (req, res) => {
 app.delete("/api/items/:id", requireAdmin, async (req, res) => {
   await sql`DELETE FROM items WHERE id = ${req.params.id}`;
   res.json({ ok: true });
+});
+
+// ---------- Speech-to-text (NVIDIA Nemotron ASR) ----------
+// Admin's recorded audio clip comes in here as a file upload. We send it to
+// NVIDIA's hosted ASR model to get back plain text, then hand that text to
+// /api/voice-command below (same endpoint the browser-STT version used).
+app.post("/api/transcribe", requireAdmin, upload.single("audio"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No audio received." });
+
+  try {
+    const form = new FormData();
+    form.append("file", new Blob([req.file.buffer], { type: req.file.mimetype || "audio/wav" }), "command.wav");
+    form.append("model", "nvidia/nemotron-asr-streaming");
+    form.append("language", "en-US");
+    form.append("response_format", "json");
+
+    const asrResponse = await fetch("https://integrate.api.nvidia.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.NVIDIA_NIM_API_KEY}` },
+      body: form,
+    });
+
+    if (!asrResponse.ok) {
+      const errText = await asrResponse.text();
+      console.error("ASR error:", errText);
+      return res.status(502).json({ error: "Speech service unavailable." });
+    }
+
+    const asrData = await asrResponse.json();
+    const transcript = asrData.text?.trim();
+    if (!transcript) return res.status(422).json({ error: "Could not hear anything clear." });
+
+    res.json({ transcript });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Transcription failed." });
+  }
 });
 
 // ---------- Voice command (NVIDIA NIM) ----------
