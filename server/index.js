@@ -115,24 +115,25 @@ app.delete("/api/items/:id", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Speech-to-text (NVIDIA Nemotron 3.5 ASR via Together AI) ----------
+// ---------- Speech-to-text (Groq-hosted Whisper, free tier) ----------
 // Admin's recorded audio clip comes in here as a file upload. NVIDIA only exposes
-// this model over gRPC (Riva) on their own hosted API, so we call it through
-// Together AI's plain REST endpoint instead, then hand the text to
-// /api/voice-command below (same endpoint the browser-STT version used).
+// its ASR NIM over gRPC (Riva) on its own hosted API, and Together AI requires a
+// paid credit balance, so we use Groq's free, OpenAI-compatible endpoint instead,
+// then hand the text to /api/voice-command below (same endpoint the browser-STT
+// version used).
 app.post("/api/transcribe", requireAdmin, upload.single("audio"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No audio received." });
 
   try {
     const form = new FormData();
     form.append("file", new Blob([req.file.buffer], { type: req.file.mimetype || "audio/wav" }), "command.wav");
-    form.append("model", "nvidia/nemotron-3.5-asr-streaming-0.6b");
+    form.append("model", "whisper-large-v3-turbo");
     form.append("language", "en");
     form.append("response_format", "json");
 
-    const asrResponse = await fetch("https://api.together.xyz/v1/audio/transcriptions", {
+    const asrResponse = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
       method: "POST",
-      headers: { Authorization: `Bearer ${process.env.TOGETHER_API_KEY}` },
+      headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
       body: form,
     });
 
