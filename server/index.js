@@ -116,11 +116,9 @@ app.delete("/api/items/:id", requireAdmin, async (req, res) => {
 });
 
 // ---------- Speech-to-text (Groq-hosted Whisper, free tier) ----------
-// Admin's recorded audio clip comes in here as a file upload. NVIDIA only exposes
-// its ASR NIM over gRPC (Riva) on its own hosted API, and Together AI requires a
-// paid credit balance, so we use Groq's free, OpenAI-compatible endpoint instead,
-// then hand the text to /api/voice-command below (same endpoint the browser-STT
-// version used).
+// Admin's recorded audio clip comes in here as a file upload. We send it to
+// Groq's free, OpenAI-compatible endpoint for transcription, then hand the
+// text to /api/voice-command below (same endpoint the browser-STT version used).
 app.post("/api/transcribe", requireAdmin, upload.single("audio"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No audio received." });
 
@@ -154,23 +152,23 @@ app.post("/api/transcribe", requireAdmin, upload.single("audio"), async (req, re
   }
 });
 
-// ---------- Voice command (NVIDIA NIM) ----------
+// ---------- Voice command (Groq-hosted LLM) ----------
 // Admin says something like "add item Alu price 25 to Bazar" (already transcribed to text
-// by the browser's own speech recognition — see client code). This sends that text to a
-// NIM-hosted LLM, asks it to return a strict JSON action, then applies it to the database.
+// by /api/transcribe above). This sends that text to a Groq-hosted LLM, asks it to return
+// a strict JSON action, then applies it to the database.
 app.post("/api/voice-command", requireAdmin, async (req, res) => {
   const { transcript } = req.body;
   if (!transcript?.trim()) return res.status(400).json({ error: "No speech text received." });
 
   try {
-    const nimResponse = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
+    const groqResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${process.env.NVIDIA_NIM_API_KEY}`,
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: process.env.NVIDIA_NIM_MODEL,
+        model: "llama-3.3-70b-versatile",
         messages: [
           {
             role: "system",
@@ -189,14 +187,14 @@ app.post("/api/voice-command", requireAdmin, async (req, res) => {
       }),
     });
 
-    if (!nimResponse.ok) {
-      const errText = await nimResponse.text();
-      console.error("NIM error:", errText);
+    if (!groqResponse.ok) {
+      const errText = await groqResponse.text();
+      console.error("Groq LLM error:", errText);
       return res.status(502).json({ error: "Voice service unavailable." });
     }
 
-    const nimData = await nimResponse.json();
-    const raw = nimData.choices?.[0]?.message?.content?.trim() || "{}";
+    const groqData = await groqResponse.json();
+    const raw = groqData.choices?.[0]?.message?.content?.trim() || "{}";
     const cleaned = raw.replace(/```json|```/g, "").trim();
     let parsed;
     try {
