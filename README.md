@@ -1,9 +1,13 @@
 # Bazar catalog app — Neon + Groq voice admin
 
 Two roles: General (browse only) and Admin (add/edit/delete + voice commands).
-Data lives in Neon Postgres. Admin can speak commands like
-"add item Alu price 25 to Bazar in Family" and Groq turns that into a
-database update.
+Data lives in Neon Postgres. Categories are always added manually in the
+admin panel. Admin can speak commands for the two levels below that and
+Groq turns them into a database update:
+- Add a subcategory: "add subcategory electricity under family"
+- Add an item: "add item rice price 30 to bazar" (no need to say the
+  category — just the subcategory is enough, unless two categories both
+  have a subcategory with that name)
 
 ## 1. Set up Neon
 
@@ -61,11 +65,14 @@ Open the URL Vite prints (usually http://localhost:5173).
 - Log in as **admin** with the password you set in `.env`.
 - In the admin panel, use "Add category" / "Add sub" / "Add item" forms, or
   click **Speak a command**, allow microphone access, say something like
-  *"add item Alu price 25 to Bazar in Family"*, then click **Stop recording**.
+  *"add subcategory electricity under family"* or *"add item rice price 30
+  to bazar"*, then click **Stop recording**.
 - Voice input records real audio and sends it to Groq's hosted
   `whisper-large-v3-turbo` model for transcription, then the transcript is
   sent to Groq's `openai/gpt-oss-120b` to turn it into a structured
-  action, which gets applied to Neon.
+  action, which gets applied to Neon. Adding a brand-new top-level category
+  is manual-only (use the "Add category" box) — voice only handles
+  subcategories and items.
 
 ## Notes
 
@@ -76,7 +83,11 @@ Open the URL Vite prints (usually http://localhost:5173).
   this down before deploying publicly.
 - If voice commands don't match ("Subcategory not found"), it's usually
   because the LLM guessed a slightly different category/subcategory name
-  than what's in your database — try being explicit: "add item X price Y to
-  [exact subcategory] in [exact category]".
+  than what's in your database — try being explicit, e.g. "add item X
+  price Y to [exact subcategory]".
+- If two different categories both have a subcategory with the same name
+  (e.g. two "Bazar" subcategories), an item command that only names the
+  subcategory will come back asking you to also say the category — e.g.
+  "add item rice price 30 to bazar in family".
 - Groq's free tier (no credit card) covers ~2,000 requests/day and 14,400
   LLM requests/day — plenty for admin use.

@@ -231,7 +231,7 @@ function VoicePanel({ password, onApplied }) {
   return (
     <div style={{ background: "#fff", border: "1px solid #e3ddcf", borderRadius: "4px", padding: "12px 14px", marginBottom: "18px" }}>
       <p style={{ margin: "0 0 8px", fontSize: "12px", color: "#8a8477" }}>
-        Voice command \u2014 try "add item Alu price 25 to Bazar in Family"
+        Voice command \u2014 try "add item rice price 30 to bazar" or "add subcategory electricity under family"
       </p>
       {!supported && <p style={{ fontSize: "12px", color: "#b0473f", margin: "0 0 8px" }}>Microphone access isn't available in this browser.</p>}
       <button

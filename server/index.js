@@ -174,13 +174,18 @@ app.post("/api/voice-command", requireAdmin, async (req, res) => {
             role: "system",
             content:
               'You convert spoken admin commands into strict JSON for a catalog app with Category -> Subcategory -> Item. ' +
+              'Categories are added manually in the admin panel, never by voice — do not produce an add_category action. ' +
               'Reply with ONLY JSON, no prose, no markdown fences. ' +
-              'Shape: {"action":"add_item","item":"Alu","price":"25","subcategory":"Bazar","category":"Family","desc":"","img":""} ' +
-              'or {"action":"add_category","category":"Family"} ' +
-              'or {"action":"add_subcategory","category":"Family","subcategory":"Bazar"} ' +
+              'Two supported shapes: ' +
+              '{"action":"add_subcategory","category":"Family","subcategory":"Electricity"} ' +
+              '— used for phrasing like "add subcategory X under/in/to Y". ' +
+              'or {"action":"add_item","item":"Rice","price":"30","subcategory":"Bazar","category":"","desc":"","img":""} ' +
+              '— used for phrasing like "add item X price Y to Z". The category field is usually NOT spoken for items — ' +
+              'leave it as an empty string unless the command explicitly names both a subcategory and its parent category ' +
+              '(e.g. "...to Bazar in Family"). Never guess or invent a category for add_item. ' +
               'or {"action":"unknown"} if the command does not match a supported action. ' +
-              "Price should be digits only, no currency symbol. Infer category/subcategory names from what's spoken even if approximate, " +
-              "including fixing obvious mishearings or spelling variants (e.g. spoken \"bazaar\" likely means the category/subcategory \"Bazar\").",
+              "Price should be digits only, no currency symbol. Infer subcategory names from what's spoken even if approximate, " +
+              "including fixing obvious mishearings or spelling variants (e.g. spoken \"bazaar\" likely means \"Bazar\").",
           },
           { role: "user", content: transcript },
         ],
@@ -209,8 +214,7 @@ app.post("/api/voice-command", requireAdmin, async (req, res) => {
     }
 
     if (parsed.action === "add_category") {
-      const [row] = await sql`INSERT INTO categories (name) VALUES (${parsed.category}) RETURNING id, name`;
-      return res.json({ applied: parsed, result: row });
+      return res.status(422).json({ error: "Add new categories manually from the admin panel, not by voice." });
     }
 
     if (parsed.action === "add_subcategory") {
@@ -221,15 +225,36 @@ app.post("/api/voice-command", requireAdmin, async (req, res) => {
     }
 
     if (parsed.action === "add_item") {
-      const [sub] = await sql`
-        SELECT s.id FROM subcategories s
-        JOIN categories c ON c.id = s.category_id
-        WHERE s.name ILIKE ${parsed.subcategory} AND c.name ILIKE ${parsed.category}
-        LIMIT 1`;
-      if (!sub) return res.status(404).json({ error: `Subcategory "${parsed.subcategory}" not found under "${parsed.category}".` });
+      // Category is optional here — most spoken item commands only name the
+      // subcategory ("add item rice price 30 to bazar"). If a category was
+      // given, use it to disambiguate; otherwise match on subcategory name alone.
+      const matches = parsed.category?.trim()
+        ? await sql`
+            SELECT s.id, s.name AS sub_name, c.name AS cat_name FROM subcategories s
+            JOIN categories c ON c.id = s.category_id
+            WHERE s.name ILIKE ${parsed.subcategory} AND c.name ILIKE ${parsed.category}`
+        : await sql`
+            SELECT s.id, s.name AS sub_name, c.name AS cat_name FROM subcategories s
+            JOIN categories c ON c.id = s.category_id
+            WHERE s.name ILIKE ${parsed.subcategory}`;
+
+      if (matches.length === 0) {
+        return res.status(404).json({
+          error: parsed.category
+            ? `Subcategory "${parsed.subcategory}" not found under "${parsed.category}".`
+            : `Subcategory "${parsed.subcategory}" not found.`,
+        });
+      }
+      if (matches.length > 1) {
+        const options = matches.map((m) => `${m.sub_name} (in ${m.cat_name})`).join(", ");
+        return res.status(409).json({
+          error: `Multiple subcategories named "${parsed.subcategory}" exist: ${options}. Say the category too, e.g. "...to ${parsed.subcategory} in ${matches[0].cat_name}".`,
+        });
+      }
+
       const [row] = await sql`
         INSERT INTO items (subcategory_id, name, price, description, image_url)
-        VALUES (${sub.id}, ${parsed.item}, ${parsed.price || ""}, ${parsed.desc || ""}, ${parsed.img || ""})
+        VALUES (${matches[0].id}, ${parsed.item}, ${parsed.price || ""}, ${parsed.desc || ""}, ${parsed.img || ""})
         RETURNING id, name, price, description AS desc, image_url AS img`;
       return res.json({ applied: parsed, result: row });
     }
