@@ -168,7 +168,7 @@ app.post("/api/voice-command", requireAdmin, async (req, res) => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
+        model: "openai/gpt-oss-120b",
         messages: [
           {
             role: "system",
@@ -179,7 +179,8 @@ app.post("/api/voice-command", requireAdmin, async (req, res) => {
               'or {"action":"add_category","category":"Family"} ' +
               'or {"action":"add_subcategory","category":"Family","subcategory":"Bazar"} ' +
               'or {"action":"unknown"} if the command does not match a supported action. ' +
-              "Price should be digits only, no currency symbol. Infer category/subcategory names from what's spoken even if approximate.",
+              "Price should be digits only, no currency symbol. Infer category/subcategory names from what's spoken even if approximate, " +
+              "including fixing obvious mishearings or spelling variants (e.g. spoken \"bazaar\" likely means the category/subcategory \"Bazar\").",
           },
           { role: "user", content: transcript },
         ],

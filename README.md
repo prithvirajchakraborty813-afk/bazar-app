@@ -64,7 +64,7 @@ Open the URL Vite prints (usually http://localhost:5173).
   *"add item Alu price 25 to Bazar in Family"*, then click **Stop recording**.
 - Voice input records real audio and sends it to Groq's hosted
   `whisper-large-v3-turbo` model for transcription, then the transcript is
-  sent to Groq's `llama-3.3-70b-versatile` to turn it into a structured
+  sent to Groq's `openai/gpt-oss-120b` to turn it into a structured
   action, which gets applied to Neon.
 
 ## Notes
