@@ -286,11 +286,14 @@ async function buildReport({ scope, scopeId, from, to }) {
   }
   const repeats = [...byName.values()].filter((e) => e.count > 1).sort((a, b) => b.count - a.count);
 
-  // Price rises: from price_history, for items in scope, within range.
-  // NOTE: this must NOT be gated on `items` (which is filtered by created_at,
-  // i.e. when items were added) — a price change has nothing to do with when
-  // the item was originally added. Scope emptiness is already handled above
-  // via subIds, so we can query price_history directly.
+  // Price rises come from two different user actions, so we merge two sources:
+  //
+  // 1) In-place edits to an existing item's price (PUT /api/items/:id),
+  //    logged in price_history. NOTE: this must NOT be gated on `items`
+  //    (which is filtered by created_at, i.e. when items were added) — an
+  //    edit has nothing to do with when the item was originally added.
+  //    Scope emptiness is already handled above via subIds, so we can query
+  //    price_history directly.
   const history = await sql`
     SELECT ph.item_id, ph.old_price, ph.new_price, ph.changed_at, i.name
     FROM price_history ph
@@ -298,7 +301,7 @@ async function buildReport({ scope, scopeId, from, to }) {
     WHERE i.subcategory_id = ANY(${subIds}::int[])
       AND ph.changed_at >= ${from.toISOString()} AND ph.changed_at <= ${to.toISOString()}
     ORDER BY ph.changed_at DESC`;
-  const priceRises = history
+  const editRises = history
     .map((h) => ({
       name: h.name,
       from: h.old_price,
@@ -307,6 +310,42 @@ async function buildReport({ scope, scopeId, from, to }) {
       delta: toNum(h.new_price) - toNum(h.old_price),
     }))
     .filter((h) => h.delta > 0);
+
+  // 2) Repeat purchases: each buy creates a brand-new item row (see the
+  // POST /api/items handler), so a price rise between visits never touches
+  // price_history at all. Detect it by walking each name group of `items`
+  // (already scope- and date-filtered) in chronological order and comparing
+  // each purchase to the one before it.
+  const purchaseRises = [];
+  for (const [, group] of (() => {
+    const groups = new Map();
+    for (const it of items) {
+      const key = it.name.trim().toLowerCase();
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(it);
+    }
+    return groups;
+  })()) {
+    const chrono = [...group].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+    for (let i = 1; i < chrono.length; i++) {
+      const prev = chrono[i - 1];
+      const curr = chrono[i];
+      const delta = toNum(curr.price) - toNum(prev.price);
+      if (delta > 0) {
+        purchaseRises.push({
+          name: curr.name,
+          from: prev.price,
+          to: curr.price,
+          changedAt: curr.created_at,
+          delta,
+        });
+      }
+    }
+  }
+
+  const priceRises = [...editRises, ...purchaseRises].sort(
+    (a, b) => new Date(b.changedAt) - new Date(a.changedAt)
+  );
 
   return { label, total, count: items.length, byChild, repeats, priceRises, from, to };
 }
