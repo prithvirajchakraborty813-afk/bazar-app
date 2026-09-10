@@ -567,7 +567,7 @@ function ReportsPanel({ password, data }) {
             {report.repeats.length === 0 && <p style={{ fontSize: "12px", color: "#a39d8a", margin: 0 }}>Nothing repeated in this range.</p>}
             {report.repeats.map((r, i) => (
               <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", color: "#3d3a2f", padding: "2px 0" }}>
-                <span>{r.name} \u00d7{r.count}</span>
+                <span>{r.name} ×{r.count}</span>
                 <span>{fmt(r.total)} total</span>
               </div>
             ))}
@@ -578,7 +578,7 @@ function ReportsPanel({ password, data }) {
             {report.priceRises.length === 0 && <p style={{ fontSize: "12px", color: "#a39d8a", margin: 0 }}>No price rises logged in this range.</p>}
             {report.priceRises.map((r, i) => (
               <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", color: "#b0473f", padding: "2px 0" }}>
-                <span>{r.name}: {r.from} \u2192 {r.to}</span>
+                <span>{r.name}: {r.from} → {r.to}</span>
                 <span>+{fmt(r.delta)}</span>
               </div>
             ))}
@@ -657,7 +657,7 @@ function BudgetsPanel({ password, data }) {
               <button onClick={() => removeBudget(b.id)} style={ghostDanger}>Remove</button>
             </div>
             <p style={{ margin: "0 0 6px", fontSize: "11px", color: "#8a8477" }}>
-              {fmt(b.spent)} of {fmt(b.amount)} \u00b7 {b.cycleDays}-day cycle \u00b7 resets {new Date(b.cycleEnd).toLocaleDateString()}
+              {fmt(b.spent)} of {fmt(b.amount)} · {b.cycleDays}-day cycle · resets {new Date(b.cycleEnd).toLocaleDateString()}
             </p>
             <div style={{ height: "6px", background: "#eee8d8", borderRadius: "3px", overflow: "hidden" }}>
               <div style={{ height: "100%", width: `${pct}%`, background: b.over ? "#b0473f" : "#3d3a2f" }} />
@@ -778,7 +778,7 @@ function VoicePanel({ password, onApplied }) {
   return (
     <div style={{ background: "#fff", border: "1px solid #e3ddcf", borderRadius: "4px", padding: "12px 14px", marginBottom: "18px" }}>
       <p style={{ margin: "0 0 8px", fontSize: "12px", color: "#8a8477" }}>
-        Voice command \u2014 try "add item rice price 30 to bazar" or "add subcategory electricity under family"
+        Voice command — try "add item rice price 30 to bazar" or "add subcategory electricity under family"
       </p>
       {!supported && <p style={{ fontSize: "12px", color: "#b0473f", margin: "0 0 8px" }}>Microphone access isn't available in this browser.</p>}
       <button
@@ -943,7 +943,7 @@ function AdminView({ password, onLogout }) {
                         <div style={{ padding: "0 10px 10px" }}>
                           {sub.items.map((item) => (
                             <div key={item.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 0", borderTop: "1px solid #f1ede1", fontSize: "13px" }}>
-                              <span style={{ color: "#2a2a26" }}>{item.name} <span style={{ color: "#a39d8a" }}>\u2014 Price={item.price}</span></span>
+                              <span style={{ color: "#2a2a26" }}>{item.name} <span style={{ color: "#a39d8a" }}>— Price={item.price}</span></span>
                               <span style={{ display: "flex", gap: "6px" }}>
                                 <button onClick={() => startEdit(cat.id, sub.id, item)} style={ghostBtn}>Edit</button>
                                 <button onClick={() => removeItem(item.id)} style={ghostDanger}>Remove</button>
