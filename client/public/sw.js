@@ -1,8 +1,8 @@
-// Minimal offline support: cache the app shell on install, and cache-then-network
-// for GET API calls (catalog, reports, budgets) so the last-seen data is still
-// browsable with no connection. Writes (POST/PUT/DELETE) are never handled here —
-// the app queues those itself (see offlineQueue.js) and replays them on reconnect.
-const CACHE = "bazar-cache-v1";
+// Minimal offline support: cache-then-network for API GETs, and network-first
+// for the app shell (HTML/JS/CSS) so a fresh deploy is never masked by a stale
+// cached index.html pointing at an old, now-404ing JS bundle. Offline visitors
+// still get the last successfully loaded shell as a fallback.
+const CACHE = "bazar-cache-v2";
 const APP_SHELL = ["/", "/manifest.json", "/icon-192.png", "/icon-512.png"];
 
 self.addEventListener("install", (event) => {
@@ -38,8 +38,16 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // App shell: cache-first so the UI loads instantly and offline.
+  // App shell (HTML/JS/CSS/icons): network-first, so a new deploy's hashed
+  // bundle is always used when online. Cache is only a fallback for offline
+  // use, updated on every successful fetch.
   event.respondWith(
-    caches.match(request).then((cached) => cached || fetch(request).catch(() => caches.match("/")))
+    fetch(request)
+      .then((res) => {
+        const copy = res.clone();
+        caches.open(CACHE).then((cache) => cache.put(request, copy));
+        return res;
+      })
+      .catch(() => caches.match(request).then((cached) => cached || caches.match("/")))
   );
 });
