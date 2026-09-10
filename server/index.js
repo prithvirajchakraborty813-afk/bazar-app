@@ -251,7 +251,7 @@ async function buildReport({ scope, scopeId, from, to }) {
     FROM items i
     JOIN subcategories s ON s.id = i.subcategory_id
     JOIN categories c ON c.id = s.category_id
-    WHERE i.subcategory_id = ANY(${subIds})
+    WHERE i.subcategory_id = ANY(${subIds}::int[])
       AND i.created_at >= ${from.toISOString()} AND i.created_at <= ${to.toISOString()}
     ORDER BY i.created_at DESC`;
 
@@ -294,7 +294,7 @@ async function buildReport({ scope, scopeId, from, to }) {
       SELECT ph.item_id, ph.old_price, ph.new_price, ph.changed_at, i.name
       FROM price_history ph
       JOIN items i ON i.id = ph.item_id
-      WHERE i.subcategory_id = ANY(${subIds})
+      WHERE i.subcategory_id = ANY(${subIds}::int[])
         AND ph.changed_at >= ${from.toISOString()} AND ph.changed_at <= ${to.toISOString()}
       ORDER BY ph.changed_at DESC`;
     priceRises = history
@@ -318,7 +318,7 @@ app.get("/api/report", requireAdmin, async (req, res) => {
     res.json(report);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Could not build report." });
+    res.status(500).json({ error: "Could not build report.", detail: err.message });
   }
 });
 
@@ -330,7 +330,7 @@ app.get("/api/report/category/:id", requireAdmin, async (req, res) => {
     res.json(report);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Could not build report." });
+    res.status(500).json({ error: "Could not build report.", detail: err.message });
   }
 });
 
@@ -342,7 +342,7 @@ app.get("/api/report/subcategory/:id", requireAdmin, async (req, res) => {
     res.json(report);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Could not build report." });
+    res.status(500).json({ error: "Could not build report.", detail: err.message });
   }
 });
 
