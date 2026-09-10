@@ -351,6 +351,50 @@ function DateRangePicker({ from, to, onChange }) {
   );
 }
 
+function exportReportPDF(report, scopeLabel, from, to, fmt) {
+  const rows = (arr, cols) =>
+    arr.map((r) => `<tr>${cols.map((c) => `<td>${c(r)}</td>`).join("")}</tr>`).join("");
+
+  const html = `
+    <html><head><title>Spending report - ${scopeLabel}</title>
+    <style>
+      body { font-family: Georgia, serif; color: #2a2a26; padding: 24px; }
+      h1 { font-size: 20px; margin-bottom: 2px; }
+      .sub { color: #8a8477; font-size: 12px; margin-bottom: 18px; }
+      .totals { display: flex; gap: 28px; margin-bottom: 20px; }
+      .totals div p:first-child { font-size: 11px; color: #8a8477; margin: 0; }
+      .totals div p:last-child { font-size: 18px; font-weight: 600; margin: 0; }
+      h2 { font-size: 13px; margin: 18px 0 6px; border-bottom: 1px solid #ddd; padding-bottom: 3px; }
+      table { width: 100%; border-collapse: collapse; font-size: 12px; }
+      td { padding: 3px 0; }
+      td:last-child { text-align: right; }
+      .empty { font-size: 12px; color: #a39d8a; }
+      @media print { body { padding: 0; } }
+    </style></head><body>
+      <h1>Spending report</h1>
+      <p class="sub">${scopeLabel} &middot; ${from} to ${to}</p>
+      <div class="totals">
+        <div><p>Total spent</p><p>${fmt(report.total)}</p></div>
+        <div><p>Items bought</p><p>${report.count}</p></div>
+      </div>
+      ${report.byChild.length ? `<h2>Breakdown</h2><table>${rows(report.byChild, [(c) => `${c.name} (${c.count})`, (c) => fmt(c.total)])}</table>` : ""}
+      <h2>Bought more than once</h2>
+      ${report.repeats.length ? `<table>${rows(report.repeats, [(r) => `${r.name} \u00d7${r.count}`, (r) => `${fmt(r.total)} total`])}</table>` : `<p class="empty">Nothing repeated in this range.</p>`}
+      <h2>Price increases</h2>
+      ${report.priceRises.length ? `<table>${rows(report.priceRises, [(r) => `${r.name}: ${r.from} \u2192 ${r.to}`, (r) => `+${fmt(r.delta)}`])}</table>` : `<p class="empty">No price rises logged in this range.</p>`}
+    </body></html>`;
+
+  const win = window.open("", "_blank");
+  if (!win) {
+    alert("Your browser blocked the print window. Please allow pop-ups for this site and try again.");
+    return;
+  }
+  win.document.write(html);
+  win.document.close();
+  win.focus();
+  win.onload = () => win.print();
+}
+
 function ReportsPanel({ password, data }) {
   const scopes = flattenScopes(data);
   const [scopeKey, setScopeKey] = useState("global");
@@ -358,19 +402,27 @@ function ReportsPanel({ password, data }) {
   const [to, setTo] = useState(todayISO());
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
 
   const headers = { "x-admin-password": password };
 
   useEffect(() => {
     setLoading(true);
+    setError(null);
     const url =
       scopeKey === "global"
         ? `${API}/report?from=${from}&to=${to}`
         : `${API}/report/${scopeKey}?from=${from}&to=${to}`;
     fetch(url, { headers })
-      .then((res) => (res.ok ? res.json() : null))
+      .then(async (res) => {
+        if (!res.ok) {
+          const body = await res.text().catch(() => "");
+          throw new Error(`Server said ${res.status}${body ? `: ${body}` : ""}`);
+        }
+        return res.json();
+      })
       .then((d) => { setReport(d); setLoading(false); })
-      .catch(() => setLoading(false));
+      .catch((err) => { setError(err.message || "Could not load report."); setLoading(false); });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scopeKey, from, to, password]);
 
@@ -390,9 +442,23 @@ function ReportsPanel({ password, data }) {
       <DateRangePicker from={from} to={to} onChange={(f, t) => { setFrom(f); setTo(t); }} />
 
       {loading && <Empty text="Loading report..." />}
+      {error && !loading && (
+        <p style={{ fontSize: "12px", color: "#b0473f", background: "#fbeee9", border: "1px solid #f0cdc0", borderRadius: "4px", padding: "8px 10px" }}>
+          Couldn't load this report: {error}
+        </p>
+      )}
 
       {!loading && report && (
         <>
+          <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: "6px" }}>
+            <button
+              onClick={() => exportReportPDF(report, scopeKey === "global" ? "All categories" : scopes.find((s) => `${s.type}/${s.id}` === scopeKey)?.path || "", from, to, fmt)}
+              style={ghostBtn}
+            >
+              Export / Print PDF
+            </button>
+          </div>
+
           <div style={{ display: "flex", gap: "18px", marginBottom: "12px" }}>
             <div>
               <p style={{ margin: 0, fontSize: "11px", color: "#a39d8a" }}>Total spent</p>
@@ -848,11 +914,43 @@ function OfflineBanner({ online, pendingCount, syncing }) {
   );
 }
 
+// Captures the browser's install prompt (fires only when the PWA criteria
+// are met: served over https, has a manifest + service worker, not already
+// installed). Exposes a trigger and whether install is currently offered.
+function useInstallPrompt() {
+  const [deferredPrompt, setDeferredPrompt] = useState(null);
+  const [installed, setInstalled] = useState(
+    window.matchMedia?.("(display-mode: standalone)").matches || false
+  );
+
+  useEffect(() => {
+    const onPrompt = (e) => { e.preventDefault(); setDeferredPrompt(e); };
+    const onInstalled = () => { setInstalled(true); setDeferredPrompt(null); };
+    window.addEventListener("beforeinstallprompt", onPrompt);
+    window.addEventListener("appinstalled", onInstalled);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", onPrompt);
+      window.removeEventListener("appinstalled", onInstalled);
+    };
+  }, []);
+
+  const promptInstall = async () => {
+    if (!deferredPrompt) return;
+    deferredPrompt.prompt();
+    await deferredPrompt.userChoice;
+    setDeferredPrompt(null);
+  };
+
+  return { canInstall: !!deferredPrompt && !installed, promptInstall };
+}
+
 function Header({ title, onLogout, onRefresh }) {
+  const { canInstall, promptInstall } = useInstallPrompt();
   return (
     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 20px", borderBottom: "1px solid #e3ddcf" }}>
       <h1 style={{ fontFamily: "Georgia, serif", fontSize: "18px", margin: 0, color: "#2a2a26" }}>{title}</h1>
       <div style={{ display: "flex", gap: "8px" }}>
+        {canInstall && <button onClick={promptInstall} style={ghostBtn}>Install app</button>}
         <button onClick={onRefresh} style={ghostBtn}>Refresh</button>
         <button onClick={onLogout} style={ghostBtn}>Log out</button>
       </div>
