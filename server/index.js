@@ -391,6 +391,41 @@ app.get("/api/budgets", requireAdmin, async (req, res) => {
   }
 });
 
+// Read-only, no-auth version of the above for the General (non-admin) role and
+// for the app-wide alert banner that runs on every screen regardless of who's
+// signed in. Same shape, no scope internals, since budget limits aren't
+// sensitive within a household and both roles should see when one is crossed.
+app.get("/api/budgets/status", async (req, res) => {
+  try {
+    const budgets = await sql`SELECT * FROM budgets ORDER BY created_at`;
+    const results = [];
+    for (const b of budgets) {
+      const cycleStart = currentCycleStart(b.cycle_start, b.cycle_days);
+      const cycleEnd = new Date(cycleStart.getTime() + b.cycle_days * 24 * 60 * 60 * 1000);
+      const report = await buildReport({
+        scope: b.scope,
+        scopeId: b.scope_id,
+        from: cycleStart,
+        to: new Date(Math.min(Date.now(), cycleEnd.getTime())),
+      });
+      const spent = report ? report.total : 0;
+      results.push({
+        id: b.id,
+        label: b.label,
+        amount: Number(b.amount),
+        cycleDays: b.cycle_days,
+        cycleEnd,
+        spent,
+        over: spent > Number(b.amount),
+      });
+    }
+    res.json(results);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not load budget status." });
+  }
+});
+
 app.post("/api/budgets", requireAdmin, async (req, res) => {
   const { scope, scopeId, label, amount, cycleDays } = req.body;
   if (!["global", "category", "subcategory"].includes(scope)) {
@@ -419,7 +454,8 @@ app.delete("/api/budgets/:id", requireAdmin, async (req, res) => {
 });
 
 // AI advice for an over-budget scope, via the same Groq LLM used for voice commands.
-app.post("/api/budget-advice", requireAdmin, async (req, res) => {
+// No-auth: both General and Admin can request tips for lowering an over-limit budget.
+app.post("/api/budget-advice", async (req, res) => {
   const { label, amount, spent, cycleDays, topItems } = req.body;
   try {
     const groqResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -433,8 +469,10 @@ app.post("/api/budget-advice", requireAdmin, async (req, res) => {
             content:
               "You are a terse, practical household budgeting assistant. The user has exceeded a spending " +
               "limit. Given the scope name, limit, amount spent, cycle length in days, and top spending " +
-              "items, give 2-4 short, concrete, specific suggestions to get back under budget next cycle. " +
-              "Plain text, one suggestion per line, no markdown, no headers, no preamble.",
+              "items, give 2-4 short, concrete, specific suggestions for lowering spend and staying under " +
+              "budget next cycle - e.g. which categories to cut, whether the limit itself is unrealistic " +
+              "and should be raised or lowered, and specific swaps. Plain text, one suggestion per line, " +
+              "no markdown, no headers, no preamble.",
           },
           {
             role: "user",

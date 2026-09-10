@@ -38,6 +38,84 @@ function useOnlineSync(headers) {
   return { online, pendingCount, syncing, trySync, refreshPending };
 }
 
+// Polls the no-auth budget-status endpoint so both roles (General has no
+// password to call the admin-only /api/budgets) see when any limit is
+// crossed, on every screen - not just the Budgets tab. Mounted once near the
+// top of the app shell in both AdminView and GeneralView.
+function useOverBudgets() {
+  const [overBudgets, setOverBudgets] = useState([]);
+
+  const check = () => {
+    fetch(`${API}/budgets/status`)
+      .then((res) => (res.ok ? res.json() : []))
+      .then((all) => setOverBudgets(all.filter((b) => b.over)))
+      .catch(() => {});
+  };
+
+  useEffect(() => {
+    check();
+    const id = setInterval(check, 60000); // recheck every minute while the app is open
+    return () => clearInterval(id);
+  }, []);
+
+  return { overBudgets, recheck: check };
+}
+
+function GlobalBudgetAlert({ overBudgets }) {
+  const [dismissed, setDismissed] = useState({}); // budgetId -> true, cleared on reload
+  const [advice, setAdvice] = useState({}); // budgetId -> text
+
+  const visible = overBudgets.filter((b) => !dismissed[b.id]);
+  if (visible.length === 0) return null;
+
+  const fmt = (n) => Number(n).toFixed(2).replace(/\.00$/, "");
+
+  const getAdvice = async (b) => {
+    setAdvice((a) => ({ ...a, [b.id]: "Thinking..." }));
+    try {
+      const res = await fetch(`${API}/budget-advice`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label: b.label, amount: b.amount, spent: b.spent, cycleDays: b.cycleDays }),
+      });
+      const d = await res.json();
+      setAdvice((a) => ({ ...a, [b.id]: d.advice || d.error || "No advice available." }));
+    } catch {
+      setAdvice((a) => ({ ...a, [b.id]: "Could not reach the advice service." }));
+    }
+  };
+
+  return (
+    <div style={{ padding: "10px 20px 0" }}>
+      {visible.map((b) => (
+        <div key={b.id} style={{ background: "#fbeee9", border: "1px solid #f0cdc0", borderRadius: "4px", padding: "10px 12px", marginBottom: "8px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "8px" }}>
+            <div>
+              <p style={{ margin: 0, fontSize: "13px", fontWeight: "600", color: "#9a4a3a" }}>
+                Over budget: {b.label}
+              </p>
+              <p style={{ margin: "2px 0 0", fontSize: "12px", color: "#9a4a3a" }}>
+                Spent {fmt(b.spent)} of {fmt(b.amount)} limit ({b.cycleDays}-day cycle)
+              </p>
+            </div>
+            <button onClick={() => setDismissed((d) => ({ ...d, [b.id]: true }))} style={{ ...ghostBtn, borderColor: "#f0cdc0", color: "#9a4a3a", flexShrink: 0 }}>
+              Dismiss
+            </button>
+          </div>
+          {!advice[b.id] && (
+            <button onClick={() => getAdvice(b)} style={{ ...ghostBtn, marginTop: "8px", borderColor: "#f0cdc0", color: "#9a4a3a" }}>
+              Get AI tips to lower this budget
+            </button>
+          )}
+          {advice[b.id] && (
+            <p style={{ margin: "8px 0 0", fontSize: "12px", color: "#7a4438", whiteSpace: "pre-line" }}>{advice[b.id]}</p>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function Login({ onLogin }) {
   const [role, setRole] = useState("general");
   const [pass, setPass] = useState("");
@@ -136,10 +214,12 @@ function GeneralView({ onLogout }) {
   const { data, loading, reload } = useCatalog();
   const [openCat, setOpenCat] = useState(null);
   const [openSub, setOpenSub] = useState(null);
+  const { overBudgets } = useOverBudgets();
 
   return (
     <div style={{ minHeight: "560px", background: "#f6f3ec" }}>
       <Header title="Explore" onLogout={onLogout} onRefresh={reload} />
+      <GlobalBudgetAlert overBudgets={overBudgets} />
       <div style={{ padding: "16px 20px" }}>
         {loading && <Empty text="Loading..." />}
         {!loading && data.length === 0 && <Empty text="Nothing to browse yet." />}
@@ -727,6 +807,7 @@ function AdminView({ password, onLogout }) {
   const headers = { "Content-Type": "application/json", "x-admin-password": password };
   const authHeader = { "x-admin-password": password };
   const { online, pendingCount, syncing, trySync } = useOnlineSync(authHeader);
+  const { overBudgets } = useOverBudgets();
 
   const addCategory = async () => {
     if (!newCat.trim()) return;
@@ -795,6 +876,7 @@ function AdminView({ password, onLogout }) {
   return (
     <div style={{ minHeight: "560px", background: "#f6f3ec" }}>
       <Header title="Admin" onLogout={onLogout} onRefresh={reload} />
+      <GlobalBudgetAlert overBudgets={overBudgets} />
       <div style={{ padding: "16px 20px" }}>
         <OfflineBanner online={online} pendingCount={pendingCount} syncing={syncing} />
 
@@ -935,22 +1017,68 @@ function useInstallPrompt() {
   }, []);
 
   const promptInstall = async () => {
-    if (!deferredPrompt) return;
+    if (!deferredPrompt) return false;
     deferredPrompt.prompt();
     await deferredPrompt.userChoice;
     setDeferredPrompt(null);
+    return true;
   };
 
-  return { canInstall: !!deferredPrompt && !installed, promptInstall };
+  return { hasNativePrompt: !!deferredPrompt, installed, promptInstall };
+}
+
+// Platform-specific manual steps for browsers that never fire
+// beforeinstallprompt (iOS Safari, and Android browsers after the native
+// prompt has already been dismissed once).
+function installInstructions() {
+  const ua = navigator.userAgent || "";
+  const isIOS = /iphone|ipad|ipod/i.test(ua);
+  if (isIOS) {
+    return 'Tap the Share icon in Safari\'s toolbar, then choose "Add to Home Screen".';
+  }
+  return 'Open the browser menu (\u22ee) and choose "Install app" or "Add to Home screen".';
+}
+
+function DownloadAppButton() {
+  const { hasNativePrompt, installed, promptInstall } = useInstallPrompt();
+  const [showInstructions, setShowInstructions] = useState(false);
+
+  if (installed) return null;
+
+  const handleClick = async () => {
+    if (hasNativePrompt) {
+      const accepted = await promptInstall();
+      if (!accepted) setShowInstructions(true);
+      return;
+    }
+    setShowInstructions(true);
+  };
+
+  return (
+    <div style={{ position: "relative" }}>
+      <button onClick={handleClick} style={primaryBtn}>Download app</button>
+      {showInstructions && (
+        <div
+          style={{
+            position: "absolute", top: "calc(100% + 6px)", right: 0, width: "220px", zIndex: 20,
+            background: "#fff", border: "1px solid #e3ddcf", borderRadius: "4px", padding: "12px",
+            boxShadow: "0 4px 14px rgba(0,0,0,0.12)", fontSize: "12px", color: "#3d3a2f",
+          }}
+        >
+          <p style={{ margin: "0 0 8px" }}>{installInstructions()}</p>
+          <button onClick={() => setShowInstructions(false)} style={{ ...ghostBtn, width: "100%" }}>Got it</button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function Header({ title, onLogout, onRefresh }) {
-  const { canInstall, promptInstall } = useInstallPrompt();
   return (
     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 20px", borderBottom: "1px solid #e3ddcf" }}>
       <h1 style={{ fontFamily: "Georgia, serif", fontSize: "18px", margin: 0, color: "#2a2a26" }}>{title}</h1>
-      <div style={{ display: "flex", gap: "8px" }}>
-        {canInstall && <button onClick={promptInstall} style={ghostBtn}>Install app</button>}
+      <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+        <DownloadAppButton />
         <button onClick={onRefresh} style={ghostBtn}>Refresh</button>
         <button onClick={onLogout} style={ghostBtn}>Log out</button>
       </div>
