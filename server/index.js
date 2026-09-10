@@ -103,22 +103,17 @@ app.post("/api/items", requireAdmin, async (req, res) => {
 
 app.put("/api/items/:id", requireAdmin, async (req, res) => {
   const { name, price, desc, img } = req.body;
-  if (!name?.trim()) return res.status(400).json({ error: "Item name is required." });
+  const nextPrice = price || "";
 
-  const [current] = await sql`
-    SELECT id, price FROM items WHERE id = ${req.params.id}`;
-  if (!current) return res.status(404).json({ error: "Item not found." });
+  const [existing] = await sql`SELECT price FROM items WHERE id = ${req.params.id}`;
+  if (existing && existing.price !== nextPrice) {
+    await sql`INSERT INTO price_history (item_id, old_price, new_price) VALUES (${req.params.id}, ${existing.price}, ${nextPrice})`;
+  }
 
   const [row] = await sql`
-    UPDATE items SET name = ${name.trim()}, price = ${price || ""}, description = ${desc || ""}, image_url = ${img || ""}
+    UPDATE items SET name = ${name}, price = ${nextPrice}, description = ${desc || ""}, image_url = ${img || ""}
     WHERE id = ${req.params.id}
     RETURNING id, name, price, description AS desc, image_url AS img`;
-
-  if (String(current.price || "") !== String(price || "")) {
-    await sql`
-      INSERT INTO price_history (item_id, old_price, new_price)
-      VALUES (${current.id}, ${current.price || ""}, ${price || ""})`;
-  }
   res.json(row);
 });
 
@@ -212,379 +207,278 @@ app.get("/api/spend-summary", requireAdmin, async (req, res) => {
   }
 });
 
-// ---------- Reports, price changes, and flexible budgets ----------
-// An item row represents a purchase in this app.  Keeping the calculation in
-// JavaScript makes the category/subcategory/global report use exactly the same
-// rules, while still allowing prices such as "Rs 35" in old records.
-const moneyFromText = (value) => {
-  const amount = Number(String(value ?? "").replace(/[^0-9.]/g, ""));
-  return Number.isFinite(amount) ? amount : 0;
+// ---------- Status reports (per category / subcategory / global) ----------
+// A "report" for any node in the tree (or the whole catalog) covering a
+// custom date range: total spend, per-child breakdown, items bought more
+// than once (with counts + total spent on that item), and items whose
+// price has risen (from price_history), all scoped to that node and
+// everything under it.
+const parseRange = (req) => {
+  const from = req.query.from ? new Date(req.query.from) : new Date(0);
+  const to = req.query.to ? new Date(req.query.to) : new Date();
+  // include the whole "to" day
+  to.setHours(23, 59, 59, 999);
+  return { from, to };
 };
 
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
-const dateStartUtc = (value) => {
-  if (!ISO_DATE.test(String(value || ""))) return null;
-  const date = new Date(`${value}T00:00:00.000Z`);
-  return Number.isNaN(date.getTime()) ? null : date;
-};
-const formatIsoDate = (date) => date.toISOString().slice(0, 10);
-const addUtcDays = (date, days) => new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
+async function buildReport({ scope, scopeId, from, to }) {
+  // Resolve which subcategory ids are in scope.
+  let subIds;
+  let label = "All categories";
+  if (scope === "subcategory") {
+    const [sub] = await sql`SELECT id, name FROM subcategories WHERE id = ${scopeId}`;
+    if (!sub) return null;
+    subIds = [sub.id];
+    label = sub.name;
+  } else if (scope === "category") {
+    const [cat] = await sql`SELECT id, name FROM categories WHERE id = ${scopeId}`;
+    if (!cat) return null;
+    const subs = await sql`SELECT id FROM subcategories WHERE category_id = ${scopeId}`;
+    subIds = subs.map((s) => s.id);
+    label = cat.name;
+  } else {
+    const subs = await sql`SELECT id FROM subcategories`;
+    subIds = subs.map((s) => s.id);
+  }
 
-const reportDates = (query) => {
-  const now = new Date();
-  const defaultFrom = addUtcDays(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())), -29);
-  const from = query.from ? dateStartUtc(query.from) : defaultFrom;
-  const toDay = query.to ? dateStartUtc(query.to) : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-  if (!from || !toDay || from > toDay) return null;
-  return { from, toDay, endExclusive: addUtcDays(toDay, 1) };
-};
+  if (subIds.length === 0) {
+    return { label, total: 0, count: 0, byChild: [], repeats: [], priceRises: [], from, to };
+  }
 
-const scopeMatches = (entry, scope, scopeId) =>
-  scope === "global" ||
-  (scope === "category" && entry.categoryId === scopeId) ||
-  (scope === "subcategory" && entry.subcategoryId === scopeId);
-
-const getPurchases = async () => {
-  const rows = await sql`
-    SELECT i.id, i.name, i.price, i.created_at,
-           s.id AS subcategory_id, s.name AS subcategory,
-           c.id AS category_id, c.name AS category
+  const items = await sql`
+    SELECT i.id, i.name, i.price, i.created_at, i.subcategory_id,
+           s.name AS subcategory, c.id AS category_id, c.name AS category
     FROM items i
     JOIN subcategories s ON s.id = i.subcategory_id
     JOIN categories c ON c.id = s.category_id
-    ORDER BY i.created_at ASC, i.id ASC`;
+    WHERE i.subcategory_id = ANY(${subIds})
+      AND i.created_at >= ${from.toISOString()} AND i.created_at <= ${to.toISOString()}
+    ORDER BY i.created_at DESC`;
 
-  return rows.map((row) => ({
-    id: row.id,
-    name: row.name,
-    price: row.price,
-    amount: moneyFromText(row.price),
-    createdAt: new Date(row.created_at),
-    categoryId: Number(row.category_id),
-    category: row.category,
-    subcategoryId: Number(row.subcategory_id),
-    subcategory: row.subcategory,
-  }));
-};
+  const toNum = (p) => Number(String(p || "").replace(/[^0-9.]/g, "")) || 0;
+  const total = items.reduce((sum, it) => sum + toNum(it.price), 0);
 
-const groupBy = (rows, key) => {
-  const groups = new Map();
-  rows.forEach((row) => {
-    const value = key(row);
-    groups.set(value, [...(groups.get(value) || []), row]);
-  });
-  return groups;
-};
-
-const reportPriceEdits = async (scope, scopeId, dates) => {
-  const rows = await sql`
-    SELECT h.old_price, h.new_price, h.changed_at, i.name,
-           s.id AS subcategory_id, s.name AS subcategory,
-           c.id AS category_id, c.name AS category
-    FROM price_history h
-    JOIN items i ON i.id = h.item_id
-    JOIN subcategories s ON s.id = i.subcategory_id
-    JOIN categories c ON c.id = s.category_id
-    WHERE h.changed_at >= ${dates.from.toISOString()}
-      AND h.changed_at < ${dates.endExclusive.toISOString()}
-    ORDER BY h.changed_at DESC`;
-  return rows
-    .map((row) => ({
-      name: row.name,
-      oldPrice: row.old_price,
-      newPrice: row.new_price,
-      oldAmount: moneyFromText(row.old_price),
-      newAmount: moneyFromText(row.new_price),
-      changedAt: row.changed_at,
-      categoryId: Number(row.category_id),
-      category: row.category,
-      subcategoryId: Number(row.subcategory_id),
-      subcategory: row.subcategory,
-      source: "price edit",
-    }))
-    .filter((row) => row.newAmount > row.oldAmount && scopeMatches(row, scope, scopeId));
-};
-
-app.get("/api/reports", requireAdmin, async (req, res) => {
-  const scope = String(req.query.scope || "global");
-  const scopeId = Number(req.query.id);
-  const dates = reportDates(req.query);
-  if (!['global', 'category', 'subcategory'].includes(scope)) {
-    return res.status(400).json({ error: "Report scope must be global, category, or subcategory." });
+  // Breakdown by immediate child: subcategories if scope is category/global-per-cat,
+  // or categories if scope is global (so the global report shows spend per category).
+  const byChildMap = new Map();
+  for (const it of items) {
+    const key = scope === "global" ? `cat:${it.category_id}` : `sub:${it.subcategory_id}`;
+    const name = scope === "global" ? it.category : it.subcategory;
+    const entry = byChildMap.get(key) || { name, total: 0, count: 0 };
+    entry.total += toNum(it.price);
+    entry.count += 1;
+    byChildMap.set(key, entry);
   }
-  if (scope !== "global" && (!Number.isInteger(scopeId) || scopeId < 1)) {
-    return res.status(400).json({ error: "A category or subcategory id is required." });
-  }
-  if (!dates) return res.status(400).json({ error: "Choose a valid date range." });
+  const byChild = [...byChildMap.values()].sort((a, b) => b.total - a.total);
 
+  // Items bought multiple times (grouped by name, case-insensitive).
+  const byName = new Map();
+  for (const it of items) {
+    const key = it.name.trim().toLowerCase();
+    const entry = byName.get(key) || { name: it.name, count: 0, total: 0, lastPrice: null, lastDate: null };
+    entry.count += 1;
+    entry.total += toNum(it.price);
+    if (!entry.lastDate || it.created_at > entry.lastDate) {
+      entry.lastDate = it.created_at;
+      entry.lastPrice = it.price;
+    }
+    byName.set(key, entry);
+  }
+  const repeats = [...byName.values()].filter((e) => e.count > 1).sort((a, b) => b.count - a.count);
+
+  // Price rises: from price_history, for items in scope, within range.
+  const itemIds = items.map((i) => i.id);
+  let priceRises = [];
+  if (itemIds.length > 0) {
+    const history = await sql`
+      SELECT ph.item_id, ph.old_price, ph.new_price, ph.changed_at, i.name
+      FROM price_history ph
+      JOIN items i ON i.id = ph.item_id
+      WHERE i.subcategory_id = ANY(${subIds})
+        AND ph.changed_at >= ${from.toISOString()} AND ph.changed_at <= ${to.toISOString()}
+      ORDER BY ph.changed_at DESC`;
+    priceRises = history
+      .map((h) => ({
+        name: h.name,
+        from: h.old_price,
+        to: h.new_price,
+        changedAt: h.changed_at,
+        delta: toNum(h.new_price) - toNum(h.old_price),
+      }))
+      .filter((h) => h.delta > 0);
+  }
+
+  return { label, total, count: items.length, byChild, repeats, priceRises, from, to };
+}
+
+app.get("/api/report", requireAdmin, async (req, res) => {
   try {
-    const allPurchases = await getPurchases();
-    const purchases = allPurchases.filter((entry) =>
-      entry.createdAt >= dates.from &&
-      entry.createdAt < dates.endExclusive &&
-      scopeMatches(entry, scope, scopeId));
-
-    // Drill down one level: global -> categories, category -> subcategories,
-    // subcategory -> individual items.
-    const breakdownKey = scope === "global"
-      ? (entry) => `category:${entry.categoryId}`
-      : scope === "category"
-        ? (entry) => `subcategory:${entry.subcategoryId}`
-        : (entry) => `item:${entry.name.trim().toLocaleLowerCase()}`;
-    const breakdown = [...groupBy(purchases, breakdownKey).values()]
-      .map((entries) => ({
-        id: scope === "global" ? entries[0].categoryId : scope === "category" ? entries[0].subcategoryId : null,
-        name: scope === "global" ? entries[0].category : scope === "category" ? entries[0].subcategory : entries[0].name,
-        spend: entries.reduce((sum, entry) => sum + entry.amount, 0),
-        purchases: entries.length,
-      }))
-      .sort((a, b) => b.spend - a.spend || a.name.localeCompare(b.name));
-
-    const repeatedItems = [...groupBy(purchases, (entry) => entry.name.trim().toLocaleLowerCase()).values()]
-      .filter((entries) => entries.length > 1)
-      .map((entries) => ({
-        name: entries[0].name,
-        purchases: entries.length,
-        spend: entries.reduce((sum, entry) => sum + entry.amount, 0),
-        category: entries[0].category,
-        subcategory: entries[0].subcategory,
-        lastBoughtAt: entries[entries.length - 1].createdAt,
-      }))
-      .sort((a, b) => b.purchases - a.purchases || b.spend - a.spend)
-      .slice(0, 50);
-
-    // Price rises are detected both for repeated purchases and explicit edits.
-    const purchasePriceRises = [];
-    groupBy(purchases, (entry) => entry.name.trim().toLocaleLowerCase()).forEach((entries) => {
-      let previous = null;
-      entries.forEach((entry) => {
-        if (previous && entry.amount > previous.amount) {
-          purchasePriceRises.push({
-            name: entry.name,
-            oldPrice: previous.price,
-            newPrice: entry.price,
-            oldAmount: previous.amount,
-            newAmount: entry.amount,
-            changedAt: entry.createdAt,
-            category: entry.category,
-            subcategory: entry.subcategory,
-            source: "repeat purchase",
-          });
-        }
-        previous = entry;
-      });
-    });
-    const priceIncreases = [...purchasePriceRises, ...(await reportPriceEdits(scope, scopeId, dates))]
-      .sort((a, b) => new Date(b.changedAt) - new Date(a.changedAt))
-      .slice(0, 50)
-      .map((entry) => ({ ...entry, increase: entry.newAmount - entry.oldAmount }));
-
-    const selectedName = scope === "global"
-      ? "All spending"
-      : allPurchases.find((entry) => scopeMatches(entry, scope, scopeId))?.[scope] || "Selected scope";
-    const inclusiveDays = Math.round((dates.toDay - dates.from) / (24 * 60 * 60 * 1000)) + 1;
-    const total = purchases.reduce((sum, entry) => sum + entry.amount, 0);
-
-    res.json({
-      scope,
-      scopeId: scope === "global" ? null : scopeId,
-      scopeName: selectedName,
-      from: formatIsoDate(dates.from),
-      to: formatIsoDate(dates.toDay),
-      days: inclusiveDays,
-      total,
-      averagePerDay: total / inclusiveDays,
-      purchaseCount: purchases.length,
-      breakdown,
-      repeatedItems,
-      priceIncreases,
-    });
+    const { from, to } = parseRange(req);
+    const report = await buildReport({ scope: "global", scopeId: null, from, to });
+    res.json(report);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Could not load this report." });
+    res.status(500).json({ error: "Could not build report." });
   }
 });
 
-const getBudgetCycle = (budget) => {
-  const start = dateStartUtc(String(budget.start_date).slice(0, 10));
-  const today = new Date();
-  const todayStart = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
-  const rawDays = Math.floor((todayStart - start) / (24 * 60 * 60 * 1000));
-  const cycleIndex = Math.max(0, Math.floor(rawDays / Number(budget.period_days)));
-  const cycleStart = addUtcDays(start, cycleIndex * Number(budget.period_days));
-  return {
-    cycleStart,
-    cycleEnd: addUtcDays(cycleStart, Number(budget.period_days)),
-    cycleNumber: cycleIndex + 1,
-  };
-};
-
-const getBudgetStatuses = async () => {
-  const [budgetRows, purchases] = await Promise.all([
-    sql`
-      SELECT b.*, c.name AS category_name, s.name AS subcategory_name
-      FROM budgets b
-      LEFT JOIN categories c ON c.id = b.category_id
-      LEFT JOIN subcategories s ON s.id = b.subcategory_id
-      ORDER BY b.created_at DESC`,
-    getPurchases(),
-  ]);
-
-  return budgetRows.map((budget) => {
-    const cycle = getBudgetCycle(budget);
-    const scopeId = budget.scope === "category" ? Number(budget.category_id) : Number(budget.subcategory_id);
-    const relevant = purchases.filter((entry) =>
-      entry.createdAt >= cycle.cycleStart &&
-      entry.createdAt < cycle.cycleEnd &&
-      scopeMatches(entry, budget.scope, scopeId));
-    const spend = relevant.reduce((sum, entry) => sum + entry.amount, 0);
-    const amount = Number(budget.amount);
-    return {
-      id: budget.id,
-      scope: budget.scope,
-      scopeId: budget.scope === "global" ? null : scopeId,
-      scopeName: budget.scope === "global"
-        ? "All spending"
-        : budget.scope === "category" ? budget.category_name : budget.subcategory_name,
-      amount,
-      periodDays: Number(budget.period_days),
-      startDate: String(budget.start_date).slice(0, 10),
-      cycleStart: formatIsoDate(cycle.cycleStart),
-      cycleEnd: formatIsoDate(addUtcDays(cycle.cycleEnd, -1)),
-      cycleNumber: cycle.cycleNumber,
-      spend,
-      remaining: amount - spend,
-      percent: amount === 0 ? (spend > 0 ? 100 : 0) : Math.round((spend / amount) * 100),
-      isOver: spend > amount,
-      purchaseCount: relevant.length,
-    };
-  });
-};
-
-const validateBudget = (body) => {
-  const scope = String(body.scope || "");
-  const amount = Number(body.amount);
-  const periodDays = Number(body.periodDays);
-  const scopeId = Number(body.scopeId);
-  const startDate = body.startDate || formatIsoDate(new Date());
-  if (!['global', 'category', 'subcategory'].includes(scope)) return { error: "Choose a valid budget scope." };
-  if (!Number.isFinite(amount) || amount < 0) return { error: "Budget amount must be zero or more." };
-  if (!Number.isInteger(periodDays) || periodDays < 1 || periodDays > 3650) return { error: "Budget period must be between 1 and 3650 days." };
-  if (!dateStartUtc(startDate)) return { error: "Choose a valid budget start date." };
-  if (scope !== "global" && (!Number.isInteger(scopeId) || scopeId < 1)) return { error: "Choose a category or subcategory." };
-  return { scope, amount, periodDays, scopeId, startDate };
-};
-
-app.get("/api/budgets", requireAdmin, async (_req, res) => {
+app.get("/api/report/category/:id", requireAdmin, async (req, res) => {
   try {
-    res.json(await getBudgetStatuses());
+    const { from, to } = parseRange(req);
+    const report = await buildReport({ scope: "category", scopeId: req.params.id, from, to });
+    if (!report) return res.status(404).json({ error: "Category not found." });
+    res.json(report);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not build report." });
+  }
+});
+
+app.get("/api/report/subcategory/:id", requireAdmin, async (req, res) => {
+  try {
+    const { from, to } = parseRange(req);
+    const report = await buildReport({ scope: "subcategory", scopeId: req.params.id, from, to });
+    if (!report) return res.status(404).json({ error: "Subcategory not found." });
+    res.json(report);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not build report." });
+  }
+});
+
+// ---------- Budgets ----------
+// scope 'global' has scope_id null; 'category'/'subcategory' reference that id.
+// Each budget runs in back-to-back cycles of cycle_days starting at cycle_start,
+// auto-renewing forever (no manual reset) — currentCycleStart is computed here.
+function currentCycleStart(cycleStartISO, cycleDays) {
+  const start = new Date(cycleStartISO);
+  const msPerCycle = cycleDays * 24 * 60 * 60 * 1000;
+  const elapsed = Date.now() - start.getTime();
+  const cyclesPassed = Math.max(0, Math.floor(elapsed / msPerCycle));
+  return new Date(start.getTime() + cyclesPassed * msPerCycle);
+}
+
+app.get("/api/budgets", requireAdmin, async (req, res) => {
+  try {
+    const budgets = await sql`SELECT * FROM budgets ORDER BY created_at`;
+    const results = [];
+    for (const b of budgets) {
+      const cycleStart = currentCycleStart(b.cycle_start, b.cycle_days);
+      const cycleEnd = new Date(cycleStart.getTime() + b.cycle_days * 24 * 60 * 60 * 1000);
+      const report = await buildReport({
+        scope: b.scope,
+        scopeId: b.scope_id,
+        from: cycleStart,
+        to: new Date(Math.min(Date.now(), cycleEnd.getTime())),
+      });
+      results.push({
+        id: b.id,
+        scope: b.scope,
+        scopeId: b.scope_id,
+        label: b.label,
+        amount: Number(b.amount),
+        cycleDays: b.cycle_days,
+        cycleStart,
+        cycleEnd,
+        spent: report ? report.total : 0,
+        over: report ? report.total > Number(b.amount) : false,
+      });
+    }
+    res.json(results);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Could not load budgets." });
   }
 });
 
-app.get("/api/budgets/status", requireAdmin, async (_req, res) => {
-  try {
-    res.json(await getBudgetStatuses());
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Could not load budget status." });
-  }
-});
-
 app.post("/api/budgets", requireAdmin, async (req, res) => {
-  const budget = validateBudget(req.body);
-  if (budget.error) return res.status(400).json({ error: budget.error });
-  try {
-    const [row] = await sql`
-      INSERT INTO budgets (scope, category_id, subcategory_id, amount, period_days, start_date)
-      VALUES (
-        ${budget.scope},
-        ${budget.scope === "category" ? budget.scopeId : null},
-        ${budget.scope === "subcategory" ? budget.scopeId : null},
-        ${budget.amount}, ${budget.periodDays}, ${budget.startDate}
-      )
-      RETURNING id`;
-    const status = (await getBudgetStatuses()).find((item) => item.id === row.id);
-    res.status(201).json(status);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Could not save budget. Check the selected scope still exists." });
+  const { scope, scopeId, label, amount, cycleDays } = req.body;
+  if (!["global", "category", "subcategory"].includes(scope)) {
+    return res.status(400).json({ error: "Invalid scope." });
   }
-});
-
-app.put("/api/budgets/:id", requireAdmin, async (req, res) => {
-  const budget = validateBudget(req.body);
-  if (budget.error) return res.status(400).json({ error: budget.error });
+  if (!label?.trim() || !amount || !cycleDays) {
+    return res.status(400).json({ error: "Label, amount, and cycle length are required." });
+  }
   try {
     const [row] = await sql`
-      UPDATE budgets
-      SET scope = ${budget.scope},
-          category_id = ${budget.scope === "category" ? budget.scopeId : null},
-          subcategory_id = ${budget.scope === "subcategory" ? budget.scopeId : null},
-          amount = ${budget.amount}, period_days = ${budget.periodDays}, start_date = ${budget.startDate}
-      WHERE id = ${req.params.id}
-      RETURNING id`;
-    if (!row) return res.status(404).json({ error: "Budget not found." });
-    const status = (await getBudgetStatuses()).find((item) => item.id === row.id);
-    res.json(status);
+      INSERT INTO budgets (scope, scope_id, label, amount, cycle_days)
+      VALUES (${scope}, ${scope === "global" ? null : scopeId}, ${label.trim()}, ${amount}, ${cycleDays})
+      ON CONFLICT (scope, COALESCE(scope_id, -1))
+      DO UPDATE SET label = ${label.trim()}, amount = ${amount}, cycle_days = ${cycleDays}
+      RETURNING *`;
+    res.json(row);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Could not update budget." });
+    res.status(500).json({ error: "Could not save budget." });
   }
 });
 
 app.delete("/api/budgets/:id", requireAdmin, async (req, res) => {
-  try {
-    await sql`DELETE FROM budgets WHERE id = ${req.params.id}`;
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Could not remove budget." });
-  }
+  await sql`DELETE FROM budgets WHERE id = ${req.params.id}`;
+  res.json({ ok: true });
 });
 
-const fallbackBudgetAdvice = (budget) => {
-  const overBy = Math.max(0, budget.spend - budget.amount);
-  return [
-    `You are over this ${budget.periodDays}-day budget by ${overBy.toFixed(2)}. Pause non-essential purchases in this scope until ${budget.cycleEnd}.`,
-    `Set a practical remaining cap of 0 for this cycle, then review the repeat-purchase section to delay one repeat item where possible.`,
-    `For the next cycle, use the report's price-increase list to compare alternatives before buying items that became more expensive.`,
-  ];
-};
-
-app.post("/api/budgets/:id/advice", requireAdmin, async (req, res) => {
+// AI advice for an over-budget scope, via the same Groq LLM used for voice commands.
+app.post("/api/budget-advice", requireAdmin, async (req, res) => {
+  const { label, amount, spent, cycleDays, topItems } = req.body;
   try {
-    const budget = (await getBudgetStatuses()).find((item) => item.id === Number(req.params.id));
-    if (!budget) return res.status(404).json({ error: "Budget not found." });
-    if (!budget.isOver) return res.json({ advice: ["This budget is still within its limit. Keep checking the report as the cycle progresses."], source: "local" });
-
-    const fallback = fallbackBudgetAdvice(budget);
-    if (!process.env.GROQ_API_KEY) return res.json({ advice: fallback, source: "local" });
-
     const groqResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: "openai/gpt-oss-120b",
-        temperature: 0.3,
-        max_tokens: 220,
         messages: [
-          { role: "system", content: "Give exactly three short, practical, non-judgmental budgeting suggestions. Do not give financial, medical, or legal advice. Respond as a JSON array of strings only." },
-          { role: "user", content: `A ${budget.scopeName} spending budget is ${budget.amount} for ${budget.periodDays} days. Current cycle spend is ${budget.spend}, over by ${Math.max(0, budget.spend - budget.amount)}. The cycle ends ${budget.cycleEnd}.` },
+          {
+            role: "system",
+            content:
+              "You are a terse, practical household budgeting assistant. The user has exceeded a spending " +
+              "limit. Given the scope name, limit, amount spent, cycle length in days, and top spending " +
+              "items, give 2-4 short, concrete, specific suggestions to get back under budget next cycle. " +
+              "Plain text, one suggestion per line, no markdown, no headers, no preamble.",
+          },
+          {
+            role: "user",
+            content: `Scope: ${label}\nLimit: ${amount} over ${cycleDays} days\nSpent: ${spent}\nTop items: ${JSON.stringify(topItems || [])}`,
+          },
         ],
+        temperature: 0.4,
       }),
     });
-    if (!groqResponse.ok) return res.json({ advice: fallback, source: "local" });
-    const raw = (await groqResponse.json()).choices?.[0]?.message?.content?.trim() || "";
-    const parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
-    const advice = Array.isArray(parsed) ? parsed.filter((item) => typeof item === "string").slice(0, 3) : fallback;
-    res.json({ advice: advice.length ? advice : fallback, source: advice.length ? "ai" : "local" });
+    if (!groqResponse.ok) return res.status(502).json({ error: "Advice service unavailable." });
+    const data = await groqResponse.json();
+    const advice = data.choices?.[0]?.message?.content?.trim() || "";
+    res.json({ advice });
   } catch (err) {
     console.error(err);
-    res.json({ advice: ["Review repeat purchases and delay non-essential items until the next cycle."], source: "local" });
+    res.status(500).json({ error: "Could not get advice." });
   }
+});
+
+// ---------- Offline sync ----------
+// Accepts a batch of item-add actions queued while the client was offline
+// and applies them in order. Each action: { subcategoryId, name, price, desc, img }.
+// Returns per-action results so the client knows what succeeded.
+app.post("/api/sync-items", requireAdmin, async (req, res) => {
+  const { actions } = req.body;
+  if (!Array.isArray(actions)) return res.status(400).json({ error: "actions must be an array." });
+  const results = [];
+  for (const a of actions) {
+    try {
+      if (!a.name?.trim() || !a.subcategoryId) {
+        results.push({ ok: false, error: "Missing name or subcategory." });
+        continue;
+      }
+      const [row] = await sql`
+        INSERT INTO items (subcategory_id, name, price, description, image_url)
+        VALUES (${a.subcategoryId}, ${a.name.trim()}, ${a.price || ""}, ${a.desc || ""}, ${a.img || ""})
+        RETURNING id, name, price, description AS desc, image_url AS img`;
+      results.push({ ok: true, result: row, clientId: a.clientId });
+    } catch (err) {
+      console.error(err);
+      results.push({ ok: false, error: "Insert failed.", clientId: a.clientId });
+    }
+  }
+  res.json({ results });
 });
 
 // ---------- Speech-to-text (Groq-hosted Whisper, free tier) ----------

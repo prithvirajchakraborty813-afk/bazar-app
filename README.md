@@ -14,9 +14,6 @@ Groq turns them into a database update:
 1. Go to https://neon.tech, sign up free, create a project.
 2. Copy the connection string from the dashboard (starts with `postgresql://`).
 3. Open the Neon SQL Editor and run everything in `server/schema.sql`.
-   If you already created the first version of the app, run the updated file
-   again: its `IF NOT EXISTS` statements retain your catalog and add the
-   `price_history` and `budgets` tables.
 
 ## 2. Get a Groq API key
 
@@ -62,10 +59,6 @@ npm run dev
 
 Open the URL Vite prints (usually http://localhost:5173).
 
-For local development, copy `client/.env.example` to `client/.env` first. For
-a deployment, set `VITE_API_URL` to the deployed server URL plus `/api` before
-building the frontend.
-
 ## 5. Using it
 
 - Log in as **general** to browse (read-only).
@@ -86,19 +79,6 @@ building the frontend.
   a per-day breakdown for the last 30 days, and a date/time log of every
   item added, with a range selector (30 days / 3 / 6 months / 1 year /
   all time) and a "Load more" button so nothing older is ever cut off.
-- The **Reports** tab has custom start/end dates and drill-down reports for
-  all spending, every category, and every subcategory. It highlights items
-  bought repeatedly and price rises both between repeated purchases and after
-  an item price edit.
-- The **Budgets** tab accepts a global, category, or subcategory cap. Choose
-  any 1–365 day recurring cycle with the slider (for example 12 or 34 days),
-  and the app shows an over-limit alert plus practical AI suggestions. If a
-  Groq key is unavailable, it safely falls back to local suggestions.
-- The client is installable as a PWA. After it has been opened once online,
-  the catalog and app shell are available offline. New or edited items made
-  offline are stored only on that device and sync automatically after the
-  admin signs in and reconnects. Categories and subcategories still need a
-  connection because the server must issue their IDs.
 
 ## Notes
 

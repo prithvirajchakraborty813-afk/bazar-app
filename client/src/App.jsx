@@ -1,7 +1,42 @@
-import React, { useState, useEffect, useCallback } from "react";
-import { queueItemMutation, queuedItemMutationCount, replayItemMutations } from "./offlineQueue";
+import React, { useState, useEffect } from "react";
+import { queueItem, syncQueuedItems, getQueuedItems } from "./offlineQueue.js";
 
-const API = import.meta.env.VITE_API_URL || "https://bazar-app-9yxf.onrender.com/api";
+const API = "https://bazar-app-9yxf.onrender.com/api";
+
+// Tracks browser connectivity and, on reconnect, flushes any item-adds that
+// were queued while offline. Any admin component can use this to know
+// whether it's safe to hit the network right now.
+function useOnlineSync(headers) {
+  const [online, setOnline] = useState(navigator.onLine);
+  const [pendingCount, setPendingCount] = useState(0);
+  const [syncing, setSyncing] = useState(false);
+
+  const refreshPending = () => getQueuedItems().then((q) => setPendingCount(q.length));
+
+  const trySync = async () => {
+    if (!navigator.onLine) return;
+    setSyncing(true);
+    await syncQueuedItems(API, headers);
+    await refreshPending();
+    setSyncing(false);
+  };
+
+  useEffect(() => {
+    refreshPending();
+    const goOnline = () => { setOnline(true); trySync(); };
+    const goOffline = () => setOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    if (navigator.onLine) trySync();
+    return () => {
+      window.removeEventListener("online", goOnline);
+      window.removeEventListener("offline", goOffline);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return { online, pendingCount, syncing, trySync, refreshPending };
+}
 
 function Login({ onLogin }) {
   const [role, setRole] = useState("general");
@@ -85,24 +120,16 @@ function Login({ onLogin }) {
 function useCatalog() {
   const [data, setData] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
 
-  const reload = useCallback(async () => {
+  const reload = async () => {
     setLoading(true);
-    try {
-      const res = await fetch(`${API}/catalog`);
-      if (!res.ok) throw new Error("Could not load catalog.");
-      setData(await res.json());
-      setError("");
-    } catch {
-      setError("Catalog is unavailable until you reconnect. Previously opened data remains available offline.");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+    const res = await fetch(`${API}/catalog`);
+    setData(await res.json());
+    setLoading(false);
+  };
 
-  useEffect(() => { reload(); }, [reload]);
-  return { data, loading, error, reload };
+  useEffect(() => { reload(); }, []);
+  return { data, loading, reload };
 }
 
 function GeneralView({ onLogout }) {
@@ -198,7 +225,7 @@ function SpendingPanel({ password, reloadKey }) {
 
   if (!summary) return null;
 
-  const fmt = (n) => `Price=${Number(n).toFixed(2).replace(/\.00$/, "")}`;
+  const fmt = (n) => Number(n).toFixed(2).replace(/\.00$/, "");
   const fmtDateTime = (ts) =>
     new Date(ts).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 
@@ -285,258 +312,243 @@ function SpendingPanel({ password, reloadKey }) {
   );
 }
 
-const money = (value) => `₹${Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
-const dateInput = (date) => date.toISOString().slice(0, 10);
-const daysAgo = (days) => dateInput(new Date(Date.now() - days * 24 * 60 * 60 * 1000));
-
-function reportScopes(catalog) {
-  return [
-    { value: "global", label: "All spending" },
-    ...catalog.flatMap((category) => [
-      { value: `category:${category.id}`, label: `Category — ${category.name}` },
-      ...category.subs.map((subcategory) => ({
-        value: `subcategory:${subcategory.id}`,
-        label: `Subcategory — ${category.name} / ${subcategory.name}`,
-      })),
-    ]),
-  ];
+// Flattened list of { type: 'category'|'subcategory', id, name, path } for
+// picking which node a report or budget applies to.
+function flattenScopes(data) {
+  const scopes = [];
+  for (const cat of data) {
+    scopes.push({ type: "category", id: cat.id, name: cat.name, path: cat.name });
+    for (const sub of cat.subs) {
+      scopes.push({ type: "subcategory", id: sub.id, name: sub.name, path: `${cat.name} / ${sub.name}` });
+    }
+  }
+  return scopes;
 }
 
-function ReportsPanel({ password, catalog }) {
-  const [scopeKey, setScopeKey] = useState("global");
-  const [from, setFrom] = useState(daysAgo(29));
-  const [to, setTo] = useState(dateInput(new Date()));
-  const [report, setReport] = useState(null);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(true);
-  const scopes = reportScopes(catalog);
+function todayISO(offsetDays = 0) {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  return d.toISOString().slice(0, 10);
+}
 
-  useEffect(() => {
-    const [scope, id] = scopeKey.split(":");
-    const query = new URLSearchParams({ scope, from, to });
-    if (id) query.set("id", id);
-    let active = true;
-    setLoading(true);
-    fetch(`${API}/reports?${query}`, { headers: { "x-admin-password": password } })
-      .then(async (response) => {
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "Could not load report.");
-        if (active) { setReport(data); setError(""); }
-      })
-      .catch((err) => active && setError(err.message || "Could not load report."))
-      .finally(() => active && setLoading(false));
-    return () => { active = false; };
-  }, [password, scopeKey, from, to]);
-
-  const setPreset = (days) => {
-    setFrom(daysAgo(days - 1));
-    setTo(dateInput(new Date()));
-  };
-
+function DateRangePicker({ from, to, onChange }) {
+  const presets = [
+    ["7d", "7 days", -7],
+    ["30d", "30 days", -30],
+    ["90d", "90 days", -90],
+    ["365d", "1 year", -365],
+  ];
   return (
-    <section>
-      <SectionTitle title="Status reports" subtitle="Choose any category, subcategory, or all spending and set your own dates." />
-      <div style={panelStyle}>
-        <div style={{ display: "grid", gridTemplateColumns: "minmax(180px, 1.6fr) minmax(130px, 1fr) minmax(130px, 1fr)", gap: "8px", alignItems: "end" }}>
-          <label style={fieldLabel}>Report scope
-            <select value={scopeKey} onChange={(e) => setScopeKey(e.target.value)} style={inputStyle}>
-              {scopes.map((scope) => <option key={scope.value} value={scope.value}>{scope.label}</option>)}
-            </select>
-          </label>
-          <label style={fieldLabel}>From<input type="date" value={from} max={to} onChange={(e) => setFrom(e.target.value)} style={inputStyle} /></label>
-          <label style={fieldLabel}>To<input type="date" value={to} min={from} onChange={(e) => setTo(e.target.value)} style={inputStyle} /></label>
-        </div>
-        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "10px" }}>
-          {[7, 30, 90, 180].map((days) => <button key={days} onClick={() => setPreset(days)} style={ghostBtn}>Last {days} days</button>)}
-        </div>
-
-        {loading && <Empty text="Loading report..." small />}
-        {error && <p style={errorStyle}>{error}</p>}
-        {report && !loading && (
-          <div style={{ marginTop: "14px" }}>
-            <div style={{ display: "flex", gap: "18px", flexWrap: "wrap", paddingBottom: "12px", borderBottom: "1px solid #f1ede1" }}>
-              <Metric label="Total spent" value={money(report.total)} />
-              <Metric label="Purchases" value={report.purchaseCount} />
-              <Metric label="Average / day" value={money(report.averagePerDay)} />
-              <Metric label="Time frame" value={`${report.days} days`} />
-            </div>
-            <ReportList title={report.scope === "subcategory" ? "Items in this subcategory" : "Spending breakdown"} empty="No purchases in this time frame." rows={report.breakdown} render={(row) => <><span>{row.name} <small style={mutedStyle}>{row.purchases} purchase{row.purchases === 1 ? "" : "s"}</small></span><strong>{money(row.spend)}</strong></>} />
-            <ReportList title="Bought multiple times" empty="No item was bought more than once in this time frame." rows={report.repeatedItems} render={(row) => <><span>{row.name} <small style={mutedStyle}>{row.purchases} times · {row.category} / {row.subcategory}</small></span><strong>{money(row.spend)}</strong></>} />
-            <ReportList title="Price increases" empty="No price increases were recorded in this time frame." rows={report.priceIncreases} render={(row) => <><span>{row.name} <small style={mutedStyle}>{row.source} · {new Date(row.changedAt).toLocaleDateString()}</small></span><strong>{money(row.oldAmount)} → {money(row.newAmount)} <span style={{ color: "#b0473f" }}>+{money(row.increase)}</span></strong></>} />
-          </div>
-        )}
-      </div>
-    </section>
+    <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center", marginBottom: "10px" }}>
+      {presets.map(([key, label, offset]) => (
+        <button key={key} onClick={() => onChange(todayISO(offset), todayISO())} style={ghostBtn}>{label}</button>
+      ))}
+      <span style={{ fontSize: "12px", color: "#a39d8a" }}>|</span>
+      <input type="date" value={from} onChange={(e) => onChange(e.target.value, to)} style={{ ...inputStyle, flex: "none", width: "130px" }} />
+      <span style={{ fontSize: "12px", color: "#a39d8a" }}>to</span>
+      <input type="date" value={to} onChange={(e) => onChange(from, e.target.value)} style={{ ...inputStyle, flex: "none", width: "130px" }} />
+    </div>
   );
 }
 
-function ReportList({ title, empty, rows, render }) {
+function ReportsPanel({ password, data }) {
+  const scopes = flattenScopes(data);
+  const [scopeKey, setScopeKey] = useState("global");
+  const [from, setFrom] = useState(todayISO(-30));
+  const [to, setTo] = useState(todayISO());
+  const [report, setReport] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const headers = { "x-admin-password": password };
+
+  useEffect(() => {
+    setLoading(true);
+    const url =
+      scopeKey === "global"
+        ? `${API}/report?from=${from}&to=${to}`
+        : `${API}/report/${scopeKey}?from=${from}&to=${to}`;
+    fetch(url, { headers })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((d) => { setReport(d); setLoading(false); })
+      .catch(() => setLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scopeKey, from, to, password]);
+
+  const fmt = (n) => Number(n).toFixed(2).replace(/\.00$/, "");
+
   return (
-    <div style={{ marginTop: "16px" }}>
-      <p style={{ margin: "0 0 6px", fontSize: "12px", color: "#6b6659", fontWeight: "600" }}>{title}</p>
-      {rows.length === 0 ? <p style={{ margin: 0, fontSize: "12px", color: "#a39d8a" }}>{empty}</p> : (
-        <div style={{ maxHeight: "180px", overflowY: "auto", borderTop: "1px solid #f1ede1" }}>
-          {rows.map((row, index) => <div key={`${row.name}-${index}`} style={reportRowStyle}>{render(row)}</div>)}
-        </div>
+    <div style={{ background: "#fff", border: "1px solid #e3ddcf", borderRadius: "4px", padding: "14px", marginBottom: "18px" }}>
+      <p style={{ margin: "0 0 8px", fontSize: "12px", color: "#8a8477" }}>Status report</p>
+
+      <select value={scopeKey} onChange={(e) => setScopeKey(e.target.value)} style={{ ...inputStyle, marginBottom: "10px", width: "100%" }}>
+        <option value="global">All categories</option>
+        {scopes.map((s) => (
+          <option key={`${s.type}:${s.id}`} value={`${s.type}/${s.id}`}>{s.path}</option>
+        ))}
+      </select>
+
+      <DateRangePicker from={from} to={to} onChange={(f, t) => { setFrom(f); setTo(t); }} />
+
+      {loading && <Empty text="Loading report..." />}
+
+      {!loading && report && (
+        <>
+          <div style={{ display: "flex", gap: "18px", marginBottom: "12px" }}>
+            <div>
+              <p style={{ margin: 0, fontSize: "11px", color: "#a39d8a" }}>Total spent</p>
+              <p style={{ margin: 0, fontSize: "16px", fontWeight: "600", color: "#2a2a26" }}>{fmt(report.total)}</p>
+            </div>
+            <div>
+              <p style={{ margin: 0, fontSize: "11px", color: "#a39d8a" }}>Items bought</p>
+              <p style={{ margin: 0, fontSize: "16px", fontWeight: "600", color: "#2a2a26" }}>{report.count}</p>
+            </div>
+          </div>
+
+          {report.byChild.length > 0 && (
+            <div style={{ marginBottom: "12px" }}>
+              <p style={{ margin: "0 0 4px", fontSize: "12px", fontWeight: "600", color: "#3d3a2f" }}>Breakdown</p>
+              {report.byChild.map((c, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", color: "#3d3a2f", padding: "2px 0" }}>
+                  <span>{c.name} ({c.count})</span>
+                  <span>{fmt(c.total)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={{ marginBottom: "12px" }}>
+            <p style={{ margin: "0 0 4px", fontSize: "12px", fontWeight: "600", color: "#3d3a2f" }}>Bought more than once</p>
+            {report.repeats.length === 0 && <p style={{ fontSize: "12px", color: "#a39d8a", margin: 0 }}>Nothing repeated in this range.</p>}
+            {report.repeats.map((r, i) => (
+              <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", color: "#3d3a2f", padding: "2px 0" }}>
+                <span>{r.name} \u00d7{r.count}</span>
+                <span>{fmt(r.total)} total</span>
+              </div>
+            ))}
+          </div>
+
+          <div>
+            <p style={{ margin: "0 0 4px", fontSize: "12px", fontWeight: "600", color: "#3d3a2f" }}>Price increases</p>
+            {report.priceRises.length === 0 && <p style={{ fontSize: "12px", color: "#a39d8a", margin: 0 }}>No price rises logged in this range.</p>}
+            {report.priceRises.map((r, i) => (
+              <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", color: "#b0473f", padding: "2px 0" }}>
+                <span>{r.name}: {r.from} \u2192 {r.to}</span>
+                <span>+{fmt(r.delta)}</span>
+              </div>
+            ))}
+          </div>
+        </>
       )}
     </div>
   );
 }
 
-function BudgetsPanel({ password, catalog, reloadKey }) {
+function BudgetsPanel({ password, data }) {
+  const scopes = flattenScopes(data);
   const [budgets, setBudgets] = useState([]);
+  const [loading, setLoading] = useState(true);
   const [scopeKey, setScopeKey] = useState("global");
+  const [label, setLabel] = useState("");
   const [amount, setAmount] = useState("");
-  const [periodDays, setPeriodDays] = useState(30);
-  const [startDate, setStartDate] = useState(dateInput(new Date()));
-  const [editingId, setEditingId] = useState(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [advice, setAdvice] = useState({});
-  const scopes = reportScopes(catalog);
+  const [cycleDays, setCycleDays] = useState(30);
+  const [advice, setAdvice] = useState({}); // budgetId -> text
 
-  const loadBudgets = useCallback(async () => {
-    try {
-      const response = await fetch(`${API}/budgets/status`, { headers: { "x-admin-password": password } });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Could not load budgets.");
-      setBudgets(data);
-      setError("");
-    } catch (err) {
-      setError(err.message || "Could not load budgets.");
-    }
-  }, [password]);
+  const headers = { "Content-Type": "application/json", "x-admin-password": password };
 
-  useEffect(() => { loadBudgets(); }, [loadBudgets, reloadKey]);
-
-  const reset = () => {
-    setScopeKey("global"); setAmount(""); setPeriodDays(30); setStartDate(dateInput(new Date())); setEditingId(null);
+  const load = () => {
+    setLoading(true);
+    fetch(`${API}/budgets`, { headers })
+      .then((res) => (res.ok ? res.json() : []))
+      .then((d) => { setBudgets(d); setLoading(false); })
+      .catch(() => setLoading(false));
   };
 
-  const save = async () => {
-    const [scope, id] = scopeKey.split(":");
-    setBusy(true); setError("");
-    try {
-      const response = await fetch(`${API}/budgets${editingId ? `/${editingId}` : ""}`, {
-        method: editingId ? "PUT" : "POST",
-        headers: { "Content-Type": "application/json", "x-admin-password": password },
-        body: JSON.stringify({ scope, scopeId: id ? Number(id) : null, amount: Number(amount), periodDays: Number(periodDays), startDate }),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Could not save budget.");
-      reset();
-      await loadBudgets();
-    } catch (err) {
-      setError(err.message || "Could not save budget.");
-    } finally { setBusy(false); }
+  useEffect(load, [password]);
+
+  const saveBudget = async () => {
+    if (!label.trim() || !amount) return;
+    const [type, id] = scopeKey === "global" ? ["global", null] : scopeKey.split("/");
+    await fetch(`${API}/budgets`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ scope: type, scopeId: id, label: label.trim(), amount: Number(amount), cycleDays: Number(cycleDays) }),
+    });
+    setLabel(""); setAmount("");
+    load();
   };
 
-  const remove = async (id) => {
-    await fetch(`${API}/budgets/${id}`, { method: "DELETE", headers: { "x-admin-password": password } });
-    loadBudgets();
+  const removeBudget = async (id) => {
+    await fetch(`${API}/budgets/${id}`, { method: "DELETE", headers });
+    load();
   };
 
-  const startEdit = (budget) => {
-    setEditingId(budget.id);
-    setScopeKey(budget.scope === "global" ? "global" : `${budget.scope}:${budget.scopeId}`);
-    setAmount(String(budget.amount)); setPeriodDays(budget.periodDays); setStartDate(budget.startDate);
+  const getAdvice = async (b) => {
+    setAdvice((a) => ({ ...a, [b.id]: "Thinking..." }));
+    const res = await fetch(`${API}/budget-advice`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ label: b.label, amount: b.amount, spent: b.spent, cycleDays: b.cycleDays }),
+    });
+    const d = await res.json();
+    setAdvice((a) => ({ ...a, [b.id]: d.advice || d.error || "No advice available." }));
   };
 
-  const getAdvice = async (id) => {
-    setAdvice((current) => ({ ...current, [id]: { loading: true } }));
-    try {
-      const response = await fetch(`${API}/budgets/${id}/advice`, { method: "POST", headers: { "x-admin-password": password } });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Could not get suggestions.");
-      setAdvice((current) => ({ ...current, [id]: { items: data.advice, source: data.source } }));
-    } catch (err) {
-      setAdvice((current) => ({ ...current, [id]: { error: err.message || "Could not get suggestions." } }));
-    }
-  };
+  const fmt = (n) => Number(n).toFixed(2).replace(/\.00$/, "");
 
-  const over = budgets.filter((budget) => budget.isOver);
   return (
-    <section>
-      <SectionTitle title="Flexible budgets" subtitle="Set a limit for all spending, a category, or a subcategory. Every period can be any number of days." />
-      {over.length > 0 && <div style={alertStyle}>⚠ {over.length} budget{over.length === 1 ? " is" : "s are"} over its current limit. Open the card for tailored suggestions.</div>}
-      <div style={panelStyle}>
-        <div style={{ display: "grid", gridTemplateColumns: "minmax(180px, 1.5fr) minmax(130px, .7fr) minmax(130px, .8fr)", gap: "8px", alignItems: "end" }}>
-          <label style={fieldLabel}>Budget scope<select value={scopeKey} onChange={(e) => setScopeKey(e.target.value)} style={inputStyle}>{scopes.map((scope) => <option key={scope.value} value={scope.value}>{scope.label}</option>)}</select></label>
-          <label style={fieldLabel}>Limit (₹)<input type="number" min="0" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="5000" style={inputStyle} /></label>
-          <label style={fieldLabel}>Cycle starts<input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} style={inputStyle} /></label>
-        </div>
-        <label style={{ ...fieldLabel, marginTop: "12px" }}>Period: <strong>{periodDays} day{periodDays === 1 ? "" : "s"}</strong>
-          <input type="range" min="1" max="365" value={periodDays} onChange={(e) => setPeriodDays(Number(e.target.value))} style={{ width: "100%", accentColor: "#3d3a2f" }} />
-        </label>
-        <div style={{ display: "flex", gap: "6px", marginTop: "6px" }}>
-          <button onClick={save} disabled={busy || amount === ""} style={{ ...primaryBtn, opacity: busy ? .6 : 1 }}>{busy ? "Saving..." : editingId ? "Update budget" : "Set budget"}</button>
-          {editingId && <button onClick={reset} style={ghostBtn}>Cancel</button>}
-        </div>
-        {error && <p style={errorStyle}>{error}</p>}
-      </div>
+    <div style={{ background: "#fff", border: "1px solid #e3ddcf", borderRadius: "4px", padding: "14px", marginBottom: "18px" }}>
+      <p style={{ margin: "0 0 10px", fontSize: "12px", color: "#8a8477" }}>Spending limits</p>
 
-      <div style={{ display: "grid", gap: "10px", marginTop: "12px" }}>
-        {budgets.length === 0 && <Empty text="No budgets yet. Set one above to receive alerts." small />}
-        {budgets.map((budget) => {
-          const state = advice[budget.id];
-          const width = Math.min(100, Math.max(0, budget.percent));
-          return <div key={budget.id} style={{ ...panelStyle, borderColor: budget.isOver ? "#e8cfca" : "#e3ddcf", margin: 0 }}>
-            <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "10px" }}>
-              <div><strong style={{ fontSize: "14px", color: "#2a2a26" }}>{budget.scopeName}</strong><p style={{ ...mutedStyle, margin: "3px 0 0" }}>Cycle {budget.cycleStart} to {budget.cycleEnd} · {budget.periodDays} days</p></div>
-              <div style={{ display: "flex", gap: "6px" }}><button onClick={() => startEdit(budget)} style={ghostBtn}>Edit</button><button onClick={() => remove(budget.id)} style={ghostDanger}>Remove</button></div>
+      {loading && <Empty text="Loading budgets..." />}
+      {!loading && budgets.length === 0 && <Empty text="No budgets set yet." small />}
+
+      {budgets.map((b) => {
+        const pct = Math.min(100, (b.spent / b.amount) * 100);
+        return (
+          <div key={b.id} style={{ marginBottom: "12px", padding: "10px", background: b.over ? "#fbeee9" : "#faf8f2", border: `1px solid ${b.over ? "#f0cdc0" : "#eee8d8"}`, borderRadius: "4px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
+              <span style={{ fontSize: "13px", fontWeight: "600", color: "#2a2a26" }}>{b.label}</span>
+              <button onClick={() => removeBudget(b.id)} style={ghostDanger}>Remove</button>
             </div>
-            <div style={{ marginTop: "10px", display: "flex", justifyContent: "space-between", fontSize: "13px" }}><span>{money(budget.spend)} of {money(budget.amount)}</span><strong style={{ color: budget.isOver ? "#b0473f" : "#3d3a2f" }}>{budget.isOver ? `${money(-budget.remaining)} over` : `${money(budget.remaining)} left`}</strong></div>
-            <div style={{ height: "7px", background: "#eee8d8", borderRadius: "999px", marginTop: "6px", overflow: "hidden" }}><div style={{ width: `${width}%`, height: "100%", background: budget.isOver ? "#b0473f" : "#607a57" }} /></div>
-            {budget.isOver && <button onClick={() => getAdvice(budget.id)} disabled={state?.loading} style={{ ...ghostBtn, marginTop: "10px" }}>{state?.loading ? "Preparing suggestions..." : "Get AI suggestions"}</button>}
-            {state?.error && <p style={errorStyle}>{state.error}</p>}
-            {state?.items && <ol style={{ paddingLeft: "18px", margin: "10px 0 0", color: "#514d42", fontSize: "12px" }}>{state.items.map((item, index) => <li key={index} style={{ marginBottom: "4px" }}>{item}</li>)}</ol>}
-          </div>;
-        })}
+            <p style={{ margin: "0 0 6px", fontSize: "11px", color: "#8a8477" }}>
+              {fmt(b.spent)} of {fmt(b.amount)} \u00b7 {b.cycleDays}-day cycle \u00b7 resets {new Date(b.cycleEnd).toLocaleDateString()}
+            </p>
+            <div style={{ height: "6px", background: "#eee8d8", borderRadius: "3px", overflow: "hidden" }}>
+              <div style={{ height: "100%", width: `${pct}%`, background: b.over ? "#b0473f" : "#3d3a2f" }} />
+            </div>
+            {b.over && (
+              <div style={{ marginTop: "8px" }}>
+                <p style={{ margin: "0 0 4px", fontSize: "12px", color: "#b0473f", fontWeight: "600" }}>Over budget</p>
+                {!advice[b.id] && <button onClick={() => getAdvice(b)} style={ghostBtn}>Get AI suggestions</button>}
+                {advice[b.id] && <p style={{ margin: 0, fontSize: "12px", color: "#6b6659", whiteSpace: "pre-line" }}>{advice[b.id]}</p>}
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      <div style={{ marginTop: "14px", paddingTop: "14px", borderTop: "1px dashed #ddd6c4" }}>
+        <p style={{ margin: "0 0 6px", fontSize: "12px", color: "#8a8477" }}>New budget</p>
+        <select value={scopeKey} onChange={(e) => setScopeKey(e.target.value)} style={{ ...inputStyle, marginBottom: "6px", width: "100%" }}>
+          <option value="global">All categories</option>
+          {scopes.map((s) => (
+            <option key={`${s.type}:${s.id}`} value={`${s.type}/${s.id}`}>{s.path}</option>
+          ))}
+        </select>
+        <input placeholder="Label (e.g. Family groceries)" value={label} onChange={(e) => setLabel(e.target.value)} style={{ ...inputStyle, marginBottom: "6px" }} />
+        <input placeholder="Amount (e.g. 5000)" value={amount} onChange={(e) => setAmount(e.target.value)} style={{ ...inputStyle, marginBottom: "6px" }} />
+        <label style={{ display: "block", fontSize: "12px", color: "#6b6659", marginBottom: "4px" }}>
+          Cycle length: {cycleDays} day{cycleDays > 1 ? "s" : ""}
+        </label>
+        <input
+          type="range" min="1" max="365" value={cycleDays}
+          onChange={(e) => setCycleDays(e.target.value)}
+          style={{ width: "100%", marginBottom: "10px" }}
+        />
+        <button onClick={saveBudget} style={primaryBtn}>Save budget</button>
       </div>
-    </section>
+    </div>
   );
-}
-
-function useOfflineSync(password, onSynced) {
-  const [online, setOnline] = useState(navigator.onLine);
-  const [queued, setQueued] = useState(0);
-  const refreshQueue = useCallback(async () => {
-    try { setQueued(await queuedItemMutationCount()); } catch { setQueued(0); }
-  }, []);
-  const sync = useCallback(async () => {
-    if (!navigator.onLine) return;
-    try {
-      const result = await replayItemMutations({ api: API, password, onApplied: onSynced });
-      setQueued(result.remaining);
-    } catch { /* The queue will retry on the next reconnect or refresh. */ }
-  }, [password, onSynced]);
-  useEffect(() => {
-    refreshQueue();
-    const handleOnline = () => { setOnline(true); sync(); };
-    const handleOffline = () => setOnline(false);
-    window.addEventListener("online", handleOnline);
-    window.addEventListener("offline", handleOffline);
-    if (navigator.onLine) sync();
-    return () => { window.removeEventListener("online", handleOnline); window.removeEventListener("offline", handleOffline); };
-  }, [refreshQueue, sync]);
-  const queueMutation = async (mutation) => { await queueItemMutation(mutation); await refreshQueue(); };
-  return { online, queued, queueMutation, sync };
-}
-
-function OfflineBanner({ online, queued, onSync }) {
-  if (online && queued === 0) return null;
-  return <div style={{ ...alertStyle, background: online ? "#fbf5df" : "#eef1ed", color: "#514d42", borderColor: online ? "#eadcb6" : "#d8e0d3" }}>
-    {online ? `${queued} item change${queued === 1 ? "" : "s"} waiting to sync.` : "You are offline. Previously opened catalog data is available; new item changes will sync when you reconnect."}
-    {online && queued > 0 && <button onClick={onSync} style={{ ...ghostBtn, marginLeft: "10px" }}>Sync now</button>}
-  </div>;
-}
-
-function SectionTitle({ title, subtitle }) {
-  return <div style={{ margin: "0 0 8px" }}><h2 style={{ fontFamily: "Georgia, serif", fontSize: "18px", color: "#2a2a26", margin: 0 }}>{title}</h2><p style={{ ...mutedStyle, margin: "3px 0 0" }}>{subtitle}</p></div>;
-}
-
-function Metric({ label, value }) {
-  return <div><p style={{ ...mutedStyle, margin: 0 }}>{label}</p><p style={{ margin: 0, fontSize: "16px", color: "#2a2a26", fontWeight: 600 }}>{value}</p></div>;
 }
 
 function VoicePanel({ password, onApplied }) {
@@ -644,15 +656,14 @@ function AdminView({ password, onLogout }) {
   const [newSub, setNewSub] = useState({});
   const [itemDraft, setItemDraft] = useState({});
   const [editingItem, setEditingItem] = useState(null);
-  const [activePanel, setActivePanel] = useState("catalog");
-  const [actionMessage, setActionMessage] = useState("");
+  const [view, setView] = useState("catalog"); // catalog | reports | budgets
 
   const headers = { "Content-Type": "application/json", "x-admin-password": password };
-  const { online, queued, queueMutation, sync } = useOfflineSync(password, reload);
+  const authHeader = { "x-admin-password": password };
+  const { online, pendingCount, syncing, trySync } = useOnlineSync(authHeader);
 
   const addCategory = async () => {
     if (!newCat.trim()) return;
-    if (!online) return setActionMessage("Categories need a connection because new server IDs are required. Your item changes can still be queued offline.");
     await fetch(`${API}/categories`, { method: "POST", headers, body: JSON.stringify({ name: newCat.trim() }) });
     setNewCat("");
     reload();
@@ -666,7 +677,6 @@ function AdminView({ password, onLogout }) {
   const addSub = async (categoryId) => {
     const name = (newSub[categoryId] || "").trim();
     if (!name) return;
-    if (!online) return setActionMessage("Subcategories need a connection because new server IDs are required. Your item changes can still be queued offline.");
     await fetch(`${API}/subcategories`, { method: "POST", headers, body: JSON.stringify({ categoryId, name }) });
     setNewSub({ ...newSub, [categoryId]: "" });
     reload();
@@ -682,30 +692,25 @@ function AdminView({ password, onLogout }) {
   const saveItem = async (subcategoryId, key) => {
     const d = itemDraft[key];
     if (!d || !d.name?.trim()) return;
-    const mutation = editingItem?.key === key
-      ? { method: "PUT", path: `/items/${editingItem.id}`, body: d }
-      : { method: "POST", path: "/items", body: { subcategoryId, ...d } };
-    let queuedOffline = !online;
-    try {
-      if (!online) throw new TypeError("Offline");
-      const response = await fetch(`${API}${mutation.path}`, { method: mutation.method, headers, body: JSON.stringify(mutation.body) });
-      const result = await response.json();
-      if (!response.ok) {
-        setActionMessage(result.error || "Could not save item.");
-        return;
-      }
-    } catch {
-      await queueMutation(mutation);
-      queuedOffline = true;
+
+    if (!navigator.onLine && editingItem?.key !== key) {
+      // Offline: queue new items locally, apply optimistically isn't possible
+      // without a fake id, so just confirm it's queued and reset the form.
+      await queueItem({ subcategoryId, ...d });
+      setItemDraft({ ...itemDraft, [key]: { name: "", price: "", desc: "", img: "" } });
+      setEditingItem(null);
+      trySync();
+      return;
     }
-    if (queuedOffline) {
-      setActionMessage("Item saved on this device and queued for automatic sync.");
+
+    if (editingItem?.key === key) {
+      await fetch(`${API}/items/${editingItem.id}`, { method: "PUT", headers, body: JSON.stringify(d) });
     } else {
-      setActionMessage("");
+      await fetch(`${API}/items`, { method: "POST", headers, body: JSON.stringify({ subcategoryId, ...d }) });
     }
     setItemDraft({ ...itemDraft, [key]: { name: "", price: "", desc: "", img: "" } });
     setEditingItem(null);
-    if (!queuedOffline) reload();
+    reload();
   };
 
   const removeItem = async (id) => {
@@ -723,19 +728,32 @@ function AdminView({ password, onLogout }) {
 
   return (
     <div style={{ minHeight: "560px", background: "#f6f3ec" }}>
-      <Header title="Admin" onLogout={onLogout} onRefresh={() => { reload(); sync(); }} />
+      <Header title="Admin" onLogout={onLogout} onRefresh={reload} />
       <div style={{ padding: "16px 20px" }}>
-        <OfflineBanner online={online} queued={queued} onSync={sync} />
-        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "16px" }}>
-          {[['catalog', 'Catalog'], ['reports', 'Reports'], ['budgets', 'Budgets']].map(([id, label]) => <button key={id} onClick={() => setActivePanel(id)} style={{ ...ghostBtn, background: activePanel === id ? "#3d3a2f" : "#fff", color: activePanel === id ? "#fff" : "#6b6659", borderColor: activePanel === id ? "#3d3a2f" : "#ddd6c4" }}>{label}</button>)}
+        <OfflineBanner online={online} pendingCount={pendingCount} syncing={syncing} />
+
+        <div style={{ display: "flex", marginBottom: "18px", border: "1px solid #ddd6c4", borderRadius: "3px", overflow: "hidden" }}>
+          {[["catalog", "Catalog"], ["reports", "Reports"], ["budgets", "Budgets"]].map(([v, label]) => (
+            <button
+              key={v}
+              onClick={() => setView(v)}
+              style={{
+                flex: 1, padding: "9px 0", fontSize: "13px", border: "none", cursor: "pointer",
+                background: view === v ? "#3d3a2f" : "transparent", color: view === v ? "#fff" : "#6b6659",
+              }}
+            >
+              {label}
+            </button>
+          ))}
         </div>
 
-        {activePanel === "reports" && <ReportsPanel password={password} catalog={data} />}
-        {activePanel === "budgets" && <BudgetsPanel password={password} catalog={data} reloadKey={data} />}
-        {activePanel === "catalog" && <>
+        {view === "reports" && <ReportsPanel password={password} data={data} />}
+        {view === "budgets" && <BudgetsPanel password={password} data={data} />}
+
+        {view === "catalog" && (
+        <>
         <SpendingPanel password={password} reloadKey={data} />
         <VoicePanel password={password} onApplied={reload} />
-        {actionMessage && <p style={infoStyle}>{actionMessage}</p>}
 
         <div style={{ display: "flex", gap: "8px", marginBottom: "18px" }}>
           <input value={newCat} onChange={(e) => setNewCat(e.target.value)} placeholder="New category name" style={inputStyle} />
@@ -807,8 +825,25 @@ function AdminView({ password, onLogout }) {
             )}
           </div>
         ))}
-        </>}
+        </>
+        )}
       </div>
+    </div>
+  );
+}
+
+function OfflineBanner({ online, pendingCount, syncing }) {
+  if (online && pendingCount === 0) return null;
+  return (
+    <div
+      style={{
+        padding: "8px 14px", borderRadius: "4px", marginBottom: "14px", fontSize: "12px",
+        background: online ? "#eef3e8" : "#fbeee9", color: online ? "#4a6b3a" : "#9a4a3a",
+        border: `1px solid ${online ? "#cfe0bd" : "#f0cdc0"}`,
+      }}
+    >
+      {!online && "You're offline \u2014 browsing cached data. Items you add will be saved and sent when you're back online."}
+      {online && pendingCount > 0 && (syncing ? "Syncing offline changes..." : `${pendingCount} item${pendingCount > 1 ? "s" : ""} waiting to sync...`)}
     </div>
   );
 }
@@ -840,13 +875,6 @@ const inputStyle = { flex: 1, padding: "8px 10px", border: "1px solid #ddd6c4", 
 const primaryBtn = { padding: "8px 14px", background: "#3d3a2f", color: "#fff", border: "none", borderRadius: "3px", fontSize: "13px", cursor: "pointer", whiteSpace: "nowrap" };
 const ghostBtn = { padding: "5px 10px", background: "none", border: "1px solid #ddd6c4", borderRadius: "3px", fontSize: "12px", color: "#6b6659", cursor: "pointer" };
 const ghostDanger = { ...ghostBtn, color: "#b0473f", borderColor: "#e8cfca" };
-const panelStyle = { background: "#fff", border: "1px solid #e3ddcf", borderRadius: "4px", padding: "12px 14px", marginBottom: "18px" };
-const fieldLabel = { display: "flex", flexDirection: "column", gap: "4px", fontSize: "11px", color: "#6b6659" };
-const mutedStyle = { fontSize: "11px", color: "#8a8477" };
-const errorStyle = { fontSize: "12px", color: "#b0473f", margin: "10px 0 0" };
-const infoStyle = { fontSize: "12px", color: "#607a57", margin: "0 0 10px" };
-const alertStyle = { background: "#fff1ee", border: "1px solid #e8cfca", borderRadius: "4px", color: "#9a3c35", padding: "9px 11px", fontSize: "12px", margin: "0 0 12px" };
-const reportRowStyle = { display: "flex", justifyContent: "space-between", gap: "10px", alignItems: "center", padding: "6px 2px", borderBottom: "1px solid #f8f5ec", fontSize: "12px", color: "#3d3a2f" };
 
 export default function App() {
   const [role, setRole] = useState(null);

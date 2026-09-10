@@ -24,36 +24,35 @@ CREATE TABLE IF NOT EXISTS items (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- A price edit is kept as an audit record, so reports can show a real
--- increase instead of only the current price on the item.
+CREATE INDEX IF NOT EXISTS idx_subcategories_category ON subcategories(category_id);
+CREATE INDEX IF NOT EXISTS idx_items_subcategory ON items(subcategory_id);
+
+-- Logs an item's OLD price every time it changes, so price-rise reports work.
+-- Nothing is written retroactively for items that already existed before this
+-- table was added — their history simply starts from their next edit.
 CREATE TABLE IF NOT EXISTS price_history (
   id SERIAL PRIMARY KEY,
   item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-  old_price TEXT NOT NULL DEFAULT '',
-  new_price TEXT NOT NULL DEFAULT '',
-  changed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  old_price TEXT NOT NULL,
+  new_price TEXT NOT NULL,
+  changed_at TIMESTAMPTZ DEFAULT now()
 );
+CREATE INDEX IF NOT EXISTS idx_price_history_item ON price_history(item_id);
 
--- Budgets may cover everything, one category, or one subcategory.  The
--- period is intentionally expressed in days so a user can use 12, 34, 60,
--- or any other recurring window rather than being forced into a month.
+-- Adjustable-length spending limits. scope is 'global' | 'category' | 'subcategory';
+-- scope_id is NULL for global, otherwise the category/subcategory id.
+-- Cycle is a rolling block of cycle_days starting at cycle_start; once "today"
+-- passes cycle_start + cycle_days, the next cycle auto-renews from that boundary
+-- (so history stays cleanly split into consecutive N-day blocks, forever, with
+-- no manual reset needed).
 CREATE TABLE IF NOT EXISTS budgets (
   id SERIAL PRIMARY KEY,
   scope TEXT NOT NULL CHECK (scope IN ('global', 'category', 'subcategory')),
-  category_id INTEGER REFERENCES categories(id) ON DELETE CASCADE,
-  subcategory_id INTEGER REFERENCES subcategories(id) ON DELETE CASCADE,
-  amount NUMERIC(12, 2) NOT NULL CHECK (amount >= 0),
-  period_days INTEGER NOT NULL CHECK (period_days BETWEEN 1 AND 3650),
-  start_date DATE NOT NULL DEFAULT CURRENT_DATE,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CHECK (
-    (scope = 'global' AND category_id IS NULL AND subcategory_id IS NULL)
-    OR (scope = 'category' AND category_id IS NOT NULL AND subcategory_id IS NULL)
-    OR (scope = 'subcategory' AND subcategory_id IS NOT NULL)
-  )
+  scope_id INTEGER,
+  label TEXT NOT NULL,
+  amount NUMERIC NOT NULL,
+  cycle_days INTEGER NOT NULL DEFAULT 30,
+  cycle_start TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at TIMESTAMPTZ DEFAULT now()
 );
-
-CREATE INDEX IF NOT EXISTS idx_subcategories_category ON subcategories(category_id);
-CREATE INDEX IF NOT EXISTS idx_items_subcategory ON items(subcategory_id);
-CREATE INDEX IF NOT EXISTS idx_price_history_item ON price_history(item_id, changed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_budgets_scope ON budgets(scope, category_id, subcategory_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_budgets_scope ON budgets(scope, COALESCE(scope_id, -1));

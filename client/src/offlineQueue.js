@@ -1,68 +1,81 @@
+// Tiny IndexedDB queue for "add item" actions made while offline. Each queued
+// action carries a clientId so we can match it against the sync response and
+// drop it once the server confirms it was applied.
 const DB_NAME = "bazar-offline";
-const STORE_NAME = "mutations";
-const DB_VERSION = 1;
+const STORE = "pending-items";
 
-const openDb = () => new Promise((resolve, reject) => {
-  if (!window.indexedDB) return reject(new Error("Offline storage is unavailable in this browser."));
-  const request = window.indexedDB.open(DB_NAME, DB_VERSION);
-  request.onupgradeneeded = () => {
-    const db = request.result;
-    if (!db.objectStoreNames.contains(STORE_NAME)) {
-      db.createObjectStore(STORE_NAME, { keyPath: "id", autoIncrement: true });
-    }
-  };
-  request.onsuccess = () => resolve(request.result);
-  request.onerror = () => reject(request.error);
-});
-
-const requestFromStore = async (mode, value) => {
-  const db = await openDb();
+function openDB() {
   return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_NAME, mode === "getAll" ? "readonly" : "readwrite");
-    const store = transaction.objectStore(STORE_NAME);
-    const request = mode === "add" ? store.add(value) : mode === "delete" ? store.delete(value) : store.getAll();
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-    transaction.oncomplete = () => db.close();
-    transaction.onerror = () => reject(transaction.error);
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(STORE, { keyPath: "clientId" });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
   });
-};
+}
 
-export const queueItemMutation = (mutation) => requestFromStore("add", {
-  ...mutation,
-  createdAt: new Date().toISOString(),
-});
+export async function queueItem(action) {
+  const clientId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const db = await openDB();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).put({ ...action, clientId, queuedAt: Date.now() });
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+  return clientId;
+}
 
-export const getQueuedItemMutations = async () => {
-  const mutations = await requestFromStore("getAll");
-  return mutations.sort((a, b) => a.id - b.id);
-};
+export async function getQueuedItems() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readonly");
+    const req = tx.objectStore(STORE).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
 
-export const queuedItemMutationCount = async () => (await getQueuedItemMutations()).length;
+export async function removeQueuedItems(clientIds) {
+  const db = await openDB();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    const store = tx.objectStore(STORE);
+    clientIds.forEach((id) => store.delete(id));
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
 
-// Passwords are deliberately never persisted.  The current signed-in admin
-// session supplies it when connectivity returns, so queued mutations remain
-// on the device but cannot be replayed by anyone who opens its IndexedDB.
-export const replayItemMutations = async ({ api, password, onApplied }) => {
-  const queued = await getQueuedItemMutations();
-  let applied = 0;
-  for (const mutation of queued) {
-    try {
-      const response = await fetch(`${api}${mutation.path}`, {
-        method: mutation.method,
-        headers: { "Content-Type": "application/json", "x-admin-password": password },
-        body: mutation.body ? JSON.stringify(mutation.body) : undefined,
-      });
-      // A network/server failure can recover later, so leave the remaining
-      // mutations in their original order.  Validation/auth failures remain
-      // visible in the queue instead of silently throwing away user data.
-      if (!response.ok) break;
-      await requestFromStore("delete", mutation.id);
-      applied += 1;
-      onApplied?.(mutation);
-    } catch {
-      break;
-    }
+// Sends all queued items to the server in one batch; removes the ones that
+// succeeded. Returns { synced, failed } counts. Safe to call repeatedly —
+// does nothing if the queue is empty or the request fails outright (offline).
+export async function syncQueuedItems(API, headers) {
+  const queued = await getQueuedItems();
+  if (queued.length === 0) return { synced: 0, failed: 0 };
+
+  try {
+    const res = await fetch(`${API}/sync-items`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify({
+        actions: queued.map((q) => ({
+          clientId: q.clientId,
+          subcategoryId: q.subcategoryId,
+          name: q.name,
+          price: q.price,
+          desc: q.desc,
+          img: q.img,
+        })),
+      }),
+    });
+    if (!res.ok) return { synced: 0, failed: 0 };
+    const { results } = await res.json();
+    const succeededIds = results.filter((r) => r.ok).map((r) => r.clientId);
+    await removeQueuedItems(succeededIds);
+    return { synced: succeededIds.length, failed: results.length - succeededIds.length };
+  } catch {
+    return { synced: 0, failed: 0 }; // still offline or server unreachable
   }
-  return { applied, remaining: await queuedItemMutationCount() };
-};
+}
