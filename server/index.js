@@ -287,26 +287,26 @@ async function buildReport({ scope, scopeId, from, to }) {
   const repeats = [...byName.values()].filter((e) => e.count > 1).sort((a, b) => b.count - a.count);
 
   // Price rises: from price_history, for items in scope, within range.
-  const itemIds = items.map((i) => i.id);
-  let priceRises = [];
-  if (itemIds.length > 0) {
-    const history = await sql`
-      SELECT ph.item_id, ph.old_price, ph.new_price, ph.changed_at, i.name
-      FROM price_history ph
-      JOIN items i ON i.id = ph.item_id
-      WHERE i.subcategory_id = ANY(${subIds}::int[])
-        AND ph.changed_at >= ${from.toISOString()} AND ph.changed_at <= ${to.toISOString()}
-      ORDER BY ph.changed_at DESC`;
-    priceRises = history
-      .map((h) => ({
-        name: h.name,
-        from: h.old_price,
-        to: h.new_price,
-        changedAt: h.changed_at,
-        delta: toNum(h.new_price) - toNum(h.old_price),
-      }))
-      .filter((h) => h.delta > 0);
-  }
+  // NOTE: this must NOT be gated on `items` (which is filtered by created_at,
+  // i.e. when items were added) — a price change has nothing to do with when
+  // the item was originally added. Scope emptiness is already handled above
+  // via subIds, so we can query price_history directly.
+  const history = await sql`
+    SELECT ph.item_id, ph.old_price, ph.new_price, ph.changed_at, i.name
+    FROM price_history ph
+    JOIN items i ON i.id = ph.item_id
+    WHERE i.subcategory_id = ANY(${subIds}::int[])
+      AND ph.changed_at >= ${from.toISOString()} AND ph.changed_at <= ${to.toISOString()}
+    ORDER BY ph.changed_at DESC`;
+  const priceRises = history
+    .map((h) => ({
+      name: h.name,
+      from: h.old_price,
+      to: h.new_price,
+      changedAt: h.changed_at,
+      delta: toNum(h.new_price) - toNum(h.old_price),
+    }))
+    .filter((h) => h.delta > 0);
 
   return { label, total, count: items.length, byChild, repeats, priceRises, from, to };
 }
